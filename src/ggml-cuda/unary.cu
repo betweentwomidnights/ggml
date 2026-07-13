@@ -134,6 +134,39 @@ static void unary_cuda(const T * x, T * dst, const int k, cudaStream_t stream) {
     ggml_cuda_kernel_launch(unary_op_kernel<op, T>, launch_params, x, dst, k);
 }
 
+// Strided (non-contiguous) elementwise unary: read src0 and write dst via per-dim byte strides.
+// Needed because the training backward feeds permuted (non-contiguous) gradients into unary ops
+// (e.g. attention grads), which the CPU backend handles but the fast contiguous CUDA kernel does
+// not. Mirrors the strided-src0 handling already present for binary ops.
+template <float (*op)(float), typename T>
+static __global__ void unary_op_strided_kernel(
+        const char * x, char * dst, const int64_t k,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2,
+        const int64_t nb00, const int64_t nb01, const int64_t nb02, const int64_t nb03,
+        const int64_t nb0,  const int64_t nb1,  const int64_t nb2,  const int64_t nb3) {
+    const int64_t i = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
+    if (i >= k) {
+        return;
+    }
+    const int64_t i0 = i % ne0;
+    const int64_t i1 = (i / ne0) % ne1;
+    const int64_t i2 = (i / (ne0*ne1)) % ne2;
+    const int64_t i3 = i / (ne0*ne1*ne2);
+    const T xv = *(const T *)(x   + i0*nb00 + i1*nb01 + i2*nb02 + i3*nb03);
+    *(T *)(dst + i0*nb0  + i1*nb1  + i2*nb2  + i3*nb3) = (T)op((float)xv);
+}
+
+template <float (*op)(float), typename T>
+static void unary_cuda_strided(const ggml_tensor * src0, ggml_tensor * dst, cudaStream_t stream) {
+    const int64_t k = ggml_nelements(src0);
+    const int num_blocks = (int)((k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE);
+    unary_op_strided_kernel<op, T><<<num_blocks, CUDA_NEG_BLOCK_SIZE, 0, stream>>>(
+        (const char *)src0->data, (char *)dst->data, k,
+        src0->ne[0], src0->ne[1], src0->ne[2],
+        src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
+        dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3]);
+}
+
 template <float (*op)(float)>
 void ggml_cuda_op_unary(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
@@ -141,11 +174,18 @@ void ggml_cuda_op_unary(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     void * dst_d = dst->data;
     cudaStream_t stream = ctx.stream();
 
-    GGML_ASSERT(ggml_is_contiguous(src0));
-
     GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
     GGML_ASSERT( dst->type == GGML_TYPE_F32 ||  dst->type == GGML_TYPE_F16);
     GGML_ASSERT(src0->type == dst->type);
+
+    // Non-contiguous src0/dst (e.g. permuted gradients in the training backward): use the strided
+    // kernel. The fast path below requires both contiguous.
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(dst)) {
+        GGML_ASSERT(ggml_are_same_shape(src0, dst));
+        if (src0->type == GGML_TYPE_F16) unary_cuda_strided<op, half>(src0, dst, stream);
+        else                             unary_cuda_strided<op, float>(src0, dst, stream);
+        return;
+    }
 
     if (src0->type == GGML_TYPE_F16) {
         unary_cuda<op>((const half *)src0_d, (half *)dst_d, ggml_nelements(src0), stream);
