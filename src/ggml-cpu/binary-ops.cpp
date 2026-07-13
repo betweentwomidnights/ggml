@@ -46,6 +46,22 @@ static inline void vec_binary_op_non_contiguous(const int64_t n, const int64_t n
     }
 }
 
+// Strided src0 (e.g. transposed/permuted gradient tensors in autodiff backward): read src0 with
+// its dim-0 byte stride nb00 instead of assuming contiguous rows. (bakobiibizo: support strided src0)
+template <float (*op)(float, float), typename src0_t, typename src1_t, typename dst_t>
+static inline void vec_binary_op_src0_strided(const int64_t n, const size_t nb00, const int64_t ne10,
+                                              const size_t nb10, dst_t * z, const char * x, const char * y) {
+    constexpr auto src0_to_f32 = type_conversion_table<src0_t>::to_f32;
+    constexpr auto src1_to_f32 = type_conversion_table<src1_t>::to_f32;
+    constexpr auto f32_to_dst  = type_conversion_table<dst_t >::from_f32;
+
+    for (int64_t i = 0; i < n; i++) {
+        const src0_t * x_ptr = (const src0_t *)(x + i*nb00);
+        const src1_t * y_ptr = (const src1_t *)(y + (i % ne10)*nb10);
+        z[i] = f32_to_dst(op(src0_to_f32(*x_ptr), src1_to_f32(*y_ptr)));
+    }
+}
+
 template <float (*op)(float, float), typename src0_t, typename src1_t, typename dst_t>
 static void apply_binary_op(const ggml_compute_params * params, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
@@ -55,8 +71,8 @@ static void apply_binary_op(const ggml_compute_params * params, ggml_tensor * ds
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
-    GGML_ASSERT( nb0 == sizeof(dst_t));
-    GGML_ASSERT(nb00 == sizeof(src0_t));
+    GGML_ASSERT(nb0 == sizeof(dst_t));
+    const bool src0_row_contiguous = (nb00 == sizeof(src0_t));   // strided src0 handled below
 
     const auto [ir0, ir1] = get_thread_range(params, src0);
     const bool is_src1_contiguous_rows = ggml_is_contiguous_rows(src1);
@@ -90,7 +106,11 @@ static void apply_binary_op(const ggml_compute_params * params, ggml_tensor * ds
         const src0_t * src0_ptr = (const src0_t *) ((const char *) src0->data + i03*nb03 + i02*nb02 + i01*nb01);
         const src1_t * src1_ptr = (const src1_t *) ((const char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11);
 
-        if (is_src1_contiguous_rows) {
+        if (!src0_row_contiguous) {
+            // src0 is strided in dim0 (transposed/permuted autodiff grads): read it with nb00.
+            vec_binary_op_src0_strided<op, src0_t, src1_t, dst_t>(ne0, nb00, ne10, nb10, dst_ptr,
+                                           (const char *) src0_ptr, (const char *) src1_ptr);
+        } else if (is_src1_contiguous_rows) {
             // src1 is broadcastable across src0 and dst in i1, i2, i3
             const int64_t nr0 = ne00 / ne10;
 
