@@ -6471,6 +6471,25 @@ static void ggml_compute_backward(
                 ggml_add_or_set(ctx, cgraph, isrc1, ggml_reshape(ctx, ggml_cont(ctx, tensor_grad_view), src1));
             }
         } break;
+        case GGML_OP_CONCAT: {
+            // out = concat(src0, src1, dim); route the grad slab back to each source. src0 takes the
+            // [0, src0->ne[dim]) slab along dim, src1 the remainder. (Needed for the DiT inpaint
+            // local-cond path's backward — sa3.cpp training. Forward concat is unchanged.)
+            const int dim = ggml_get_op_params_i32(tensor, 0);
+            if (src0_needs_grads) {
+                struct ggml_tensor * gv = ggml_view_4d(ctx, grad,
+                    src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+                    grad->nb[1], grad->nb[2], grad->nb[3], 0);
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_reshape(ctx, ggml_cont(ctx, gv), src0));
+            }
+            if (src1_needs_grads) {
+                const size_t offset = (size_t) src0->ne[dim] * grad->nb[dim];
+                struct ggml_tensor * gv = ggml_view_4d(ctx, grad,
+                    src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
+                    grad->nb[1], grad->nb[2], grad->nb[3], offset);
+                ggml_add_or_set(ctx, cgraph, isrc1, ggml_reshape(ctx, ggml_cont(ctx, gv), src1));
+            }
+        } break;
         case GGML_OP_SUB: {
             if (src0_needs_grads) {
                 ggml_add_or_set(ctx, cgraph, isrc0, grad);
