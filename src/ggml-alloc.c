@@ -11,7 +11,11 @@
 #include <string.h>
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
-#define MAX_FREE_BLOCKS 256
+// sa3.cpp: the functional LoRA/DoRA training graph (see functional-lora-speed-plan) applies each
+// of ~228 adapters as ~20 tiny rank-sized tensors across 24 DiT blocks, fragmenting a chunk into
+// far more than the stock 256 non-contiguous free regions. Bump the per-chunk free-block capacity
+// so ggml_gallocr_reserve doesn't assert. Each free_block is 16 B, so this costs ~16 KB/chunk.
+#define MAX_FREE_BLOCKS 1024
 
 //#define GGML_ALLOCATOR_DEBUG
 
