@@ -3967,6 +3967,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         graph_evaluated_or_captured = true;
 #endif  // USE_CUDA_GRAPH
     }
+
 }
 
 #ifdef USE_CUDA_GRAPH
@@ -4687,7 +4688,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 }
             } break;
         case GGML_OP_OUT_PROD:
-            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
+            return op->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                   (op->src[0]->type == GGML_TYPE_F32 ||
+                    (op->src[0]->type == GGML_TYPE_F16 && ggml_is_contiguous(op->src[0])));
         case GGML_OP_GET_ROWS:
             {
                 switch (op->src[0]->type) {
