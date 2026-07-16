@@ -14,8 +14,13 @@
 // value is reused by 16 output elements. The +1 padding avoids shared-memory bank
 // conflicts when a column is read during the inner product.
 const uint TILE = 16;
+const uint WORKGROUP = 8;
 
-layout(local_size_x = TILE, local_size_y = TILE, local_size_z = 1) in;
+// A 64-thread workgroup computes the same 16x16 output tile as the original
+// 256-thread version. Each invocation owns a 2x2 output block. This keeps the
+// global/shared-memory traffic unchanged while exposing four independent dot
+// products per invocation, which is substantially friendlier to iGPU occupancy.
+layout(local_size_x = WORKGROUP, local_size_y = WORKGROUP, local_size_z = 1) in;
 
 shared float tile_a[TILE][TILE + 1];
 shared float tile_b[TILE][TILE + 1];
@@ -23,9 +28,13 @@ shared float tile_b[TILE][TILE + 1];
 void main() {
     const uint lx = gl_LocalInvocationID.x;
     const uint ly = gl_LocalInvocationID.y;
-    const uint i0 = gl_WorkGroupID.x * TILE + lx;
-    const uint i1 = gl_WorkGroupID.y * TILE + ly;
-    const uint load_i1 = gl_WorkGroupID.y * TILE + lx;
+    const uint local_idx = ly * WORKGROUP + lx;
+    const uint base_i0 = gl_WorkGroupID.x * TILE;
+    const uint base_i1 = gl_WorkGroupID.y * TILE;
+    const uint i00 = base_i0 + lx;
+    const uint i01 = base_i0 + lx + WORKGROUP;
+    const uint i10 = base_i1 + ly;
+    const uint i11 = base_i1 + ly + WORKGROUP;
     const uint batch = gl_WorkGroupID.z;
     const uint i2 = batch % p.ne22;
     const uint i3 = batch / p.ne22;
@@ -35,34 +44,56 @@ void main() {
     const uint a2 = i2 / r2;
     const uint a3 = i3 / r3;
 
-    float sum = 0.0;
+    float sum00 = 0.0;
+    float sum01 = 0.0;
+    float sum10 = 0.0;
+    float sum11 = 0.0;
     for (uint k0 = 0; k0 < p.ne01; k0 += TILE) {
-        const uint k = k0 + ly;
+        // 64 invocations cooperatively load 256 elements from each input tile.
+        [[unroll]] for (uint load = local_idx; load < TILE*TILE; load += WORKGROUP*WORKGROUP) {
+            const uint tk = load / TILE;
+            const uint ti = load % TILE;
+            const uint k = k0 + tk;
+            const uint ai0 = base_i0 + ti;
+            const uint bi1 = base_i1 + ti;
 
-        if (i0 < p.ne20 && k < p.ne01) {
-            const uint ai = a3*p.nb03 + a2*p.nb02 + k*p.nb01 + i0*p.nb00;
-            tile_a[ly][lx] = float(data_a[get_aoffset() + ai]);
-        } else {
-            tile_a[ly][lx] = 0.0;
-        }
+            if (ai0 < p.ne20 && k < p.ne01) {
+                const uint ai = a3*p.nb03 + a2*p.nb02 + k*p.nb01 + ai0*p.nb00;
+                tile_a[tk][ti] = float(data_a[get_aoffset() + ai]);
+            } else {
+                tile_a[tk][ti] = 0.0;
+            }
 
-        if (load_i1 < p.ne21 && k < p.ne01) {
-            const uint bi = i3*p.nb13 + i2*p.nb12 + k*p.nb11 + load_i1*p.nb10;
-            tile_b[ly][lx] = float(data_b[get_boffset() + bi]);
-        } else {
-            tile_b[ly][lx] = 0.0;
+            if (bi1 < p.ne21 && k < p.ne01) {
+                const uint bi = i3*p.nb13 + i2*p.nb12 + k*p.nb11 + bi1*p.nb10;
+                tile_b[tk][ti] = float(data_b[get_boffset() + bi]);
+            } else {
+                tile_b[tk][ti] = 0.0;
+            }
         }
 
         barrier();
 
         [[unroll]] for (uint kk = 0; kk < TILE; ++kk) {
-            sum += tile_a[kk][lx] * tile_b[kk][ly];
+            const float a0 = tile_a[kk][lx];
+            const float a1 = tile_a[kk][lx + WORKGROUP];
+            const float b0 = tile_b[kk][ly];
+            const float b1 = tile_b[kk][ly + WORKGROUP];
+            sum00 += a0 * b0;
+            sum01 += a0 * b1;
+            sum10 += a1 * b0;
+            sum11 += a1 * b1;
         }
 
         barrier();
     }
 
-    if (i0 < p.ne20 && i1 < p.ne21) {
-        data_d[get_doffset() + dst_idx(i0, i1, i2, i3)] = D_TYPE(sum);
-    }
+    if (i00 < p.ne20 && i10 < p.ne21)
+        data_d[get_doffset() + dst_idx(i00, i10, i2, i3)] = D_TYPE(sum00);
+    if (i00 < p.ne20 && i11 < p.ne21)
+        data_d[get_doffset() + dst_idx(i00, i11, i2, i3)] = D_TYPE(sum01);
+    if (i01 < p.ne20 && i10 < p.ne21)
+        data_d[get_doffset() + dst_idx(i01, i10, i2, i3)] = D_TYPE(sum10);
+    if (i01 < p.ne20 && i11 < p.ne21)
+        data_d[get_doffset() + dst_idx(i01, i11, i2, i3)] = D_TYPE(sum11);
 }
