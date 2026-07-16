@@ -8861,6 +8861,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                               64, 16, 32, {1, 1}, {1, 1}, true));
     test_cases.emplace_back(new test_out_prod(GGML_TYPE_F16, GGML_TYPE_F32,
                                               64, 16, 32, {1, 1}, {1, 1}, true));
+    // Exercise partial M/N/K tiles in both supported src0 precisions.
+    test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32,
+                                              65, 17, 23, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_out_prod(GGML_TYPE_F16, GGML_TYPE_F32,
+                                              65, 17, 23, {1, 1}, {1, 1}, true));
     test_cases.emplace_back(new test_lora_zero_b());
 
     // add_id
