@@ -1,0 +1,32 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+
+#include "types.glsl"
+#include "generic_binary_head.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint idx = get_idx();
+    if (idx >= p.ne) {
+        return;
+    }
+
+    uint i0, i1, i2, i3;
+    get_indices(idx, i0, i1, i2, i3, p.ne20, p.ne21, p.ne22, p.ne23);
+
+    const uint r2 = p.ne22 / p.ne02;
+    const uint r3 = p.ne23 / p.ne03;
+    const uint a2 = i2 / r2;
+    const uint a3 = i3 / r3;
+
+    float sum = 0.0;
+    for (uint k = 0; k < p.ne01; ++k) {
+        const uint ai = a3*p.nb03 + a2*p.nb02 + k*p.nb01 + i0*p.nb00;
+        const uint bi = i3*p.nb13 + i2*p.nb12 + k*p.nb11 + i1*p.nb10;
+        sum += float(data_a[get_aoffset() + ai]) * float(data_b[get_boffset() + bi]);
+    }
+
+    data_d[get_doffset() + dst_idx(i0, i1, i2, i3)] = D_TYPE(sum);
+}
