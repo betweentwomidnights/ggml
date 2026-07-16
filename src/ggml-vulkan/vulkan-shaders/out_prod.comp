@@ -5,16 +5,30 @@
 #include "types.glsl"
 #include "generic_binary_head.glsl"
 
-layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+// OUT_PROD is a matrix multiplication over ne01:
+//   dst[i0, i1] = sum_k src0[i0, k] * src1[i1, k]
+//
+// The original implementation assigned one output element to each invocation,
+// making every invocation reload both complete input vectors from device memory.
+// A 16x16 workgroup instead stages matching input tiles in shared memory, so each
+// value is reused by 16 output elements. The +1 padding avoids shared-memory bank
+// conflicts when a column is read during the inner product.
+const uint TILE = 16;
+
+layout(local_size_x = TILE, local_size_y = TILE, local_size_z = 1) in;
+
+shared float tile_a[TILE][TILE + 1];
+shared float tile_b[TILE][TILE + 1];
 
 void main() {
-    const uint idx = get_idx();
-    if (idx >= p.ne) {
-        return;
-    }
-
-    uint i0, i1, i2, i3;
-    get_indices(idx, i0, i1, i2, i3, p.ne20, p.ne21, p.ne22, p.ne23);
+    const uint lx = gl_LocalInvocationID.x;
+    const uint ly = gl_LocalInvocationID.y;
+    const uint i0 = gl_WorkGroupID.x * TILE + lx;
+    const uint i1 = gl_WorkGroupID.y * TILE + ly;
+    const uint load_i1 = gl_WorkGroupID.y * TILE + lx;
+    const uint batch = gl_WorkGroupID.z;
+    const uint i2 = batch % p.ne22;
+    const uint i3 = batch / p.ne22;
 
     const uint r2 = p.ne22 / p.ne02;
     const uint r3 = p.ne23 / p.ne03;
@@ -22,11 +36,33 @@ void main() {
     const uint a3 = i3 / r3;
 
     float sum = 0.0;
-    for (uint k = 0; k < p.ne01; ++k) {
-        const uint ai = a3*p.nb03 + a2*p.nb02 + k*p.nb01 + i0*p.nb00;
-        const uint bi = i3*p.nb13 + i2*p.nb12 + k*p.nb11 + i1*p.nb10;
-        sum += float(data_a[get_aoffset() + ai]) * float(data_b[get_boffset() + bi]);
+    for (uint k0 = 0; k0 < p.ne01; k0 += TILE) {
+        const uint k = k0 + ly;
+
+        if (i0 < p.ne20 && k < p.ne01) {
+            const uint ai = a3*p.nb03 + a2*p.nb02 + k*p.nb01 + i0*p.nb00;
+            tile_a[ly][lx] = float(data_a[get_aoffset() + ai]);
+        } else {
+            tile_a[ly][lx] = 0.0;
+        }
+
+        if (load_i1 < p.ne21 && k < p.ne01) {
+            const uint bi = i3*p.nb13 + i2*p.nb12 + k*p.nb11 + load_i1*p.nb10;
+            tile_b[ly][lx] = float(data_b[get_boffset() + bi]);
+        } else {
+            tile_b[ly][lx] = 0.0;
+        }
+
+        barrier();
+
+        [[unroll]] for (uint kk = 0; kk < TILE; ++kk) {
+            sum += tile_a[kk][lx] * tile_b[kk][ly];
+        }
+
+        barrier();
     }
 
-    data_d[get_doffset() + dst_idx(i0, i1, i2, i3)] = D_TYPE(sum);
+    if (i0 < p.ne20 && i1 < p.ne21) {
+        data_d[get_doffset() + dst_idx(i0, i1, i2, i3)] = D_TYPE(sum);
+    }
 }
