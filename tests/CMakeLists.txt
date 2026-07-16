@@ -1,5 +1,3 @@
-find_library(MATH_LIBRARY m)
-
 # check systems
 if (NOT UNAME_S)
     execute_process(COMMAND uname -s OUTPUT_VARIABLE UNAME_S)
