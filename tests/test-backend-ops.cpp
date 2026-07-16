@@ -4378,6 +4378,54 @@ struct test_out_prod : public test_case {
     }
 };
 
+// Backward regression for the LoRA initialization invariant. Since lora_B is
+// initialized to zero, the first-step gradient of lora_A must also be zero.
+// This graph reaches lora_A through MUL_MAT's transposed OUT_PROD backward path.
+struct test_lora_zero_b : public test_case {
+    std::string vars() override {
+        return "in=8,rank=4,out=6,tokens=3";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 8, 3);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 8, 4);
+        ggml_set_name(a, "lora_A");
+        ggml_set_param(a);
+
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 6);
+        ggml_set_name(b, "lora_B");
+        ggml_set_param(b);
+
+        ggml_tensor * ax = ggml_mul_mat(ctx, a, x);
+        ggml_set_name(ax, "lora_A_x");
+        ggml_tensor * out = ggml_mul_mat(ctx, b, ax);
+        ggml_set_name(out, "lora_zero_B_out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            if (strcmp(t->name, "lora_B") == 0) {
+                ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "LORA_ZERO_B";
+    }
+};
+
 // GGML_OP_SQR
 struct test_sqr : public test_case {
     const ggml_type type;
@@ -8680,6 +8728,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32,
                                                   256, 16, 16, {1, 1}, {nr2, 1}));
     }
+
+    // Backprop through MUL_MAT supplies OUT_PROD with a transposed F32 gradient.
+    // Cover both trainable F32 and frozen F16 left operands using LoRA-like dimensions.
+    test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32,
+                                              64, 16, 32, {1, 1}, {1, 1}, true));
+    test_cases.emplace_back(new test_out_prod(GGML_TYPE_F16, GGML_TYPE_F32,
+                                              64, 16, 32, {1, 1}, {1, 1}, true));
+    test_cases.emplace_back(new test_lora_zero_b());
 
     // add_id
     for (ggml_type type_a : {GGML_TYPE_F32}) {
