@@ -1523,14 +1523,17 @@ kernel void kernel_out_prod(
         device const char * src1,
         device       char * dst,
         uint3   tgpig[[threadgroup_position_in_grid]],
-        ushort3 tpitg[[thread_position_in_threadgroup]],
-        ushort3   ntg[[threads_per_threadgroup]]) {
-    const int i0 = tgpig.x*ntg.x + tpitg.x;
-    const int i1 = tgpig.y*ntg.y + tpitg.y;
+        ushort  tiitg[[thread_index_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
+    constexpr int tile_x = 32;
+    constexpr int tile_y = 16;
+    constexpr int tile_k = 16;
+    threadgroup float tile_a[tile_x][tile_k + 1];
+    threadgroup float tile_b[tile_y][tile_k + 1];
+    threadgroup float tile_c[tile_x][tile_y + 1];
 
-    if (i0 >= args.ne0 || i1 >= args.ne1) {
-        return;
-    }
+    const int base_i0 = tgpig.x*tile_x;
+    const int base_i1 = tgpig.y*tile_y;
 
     const int i2 = tgpig.z % args.ne2;
     const int i3 = tgpig.z / args.ne2;
@@ -1539,16 +1542,67 @@ kernel void kernel_out_prod(
     const int i02 = i2 / r2;
     const int i03 = i3 / r3;
 
-    float sum = 0.0f;
-    for (int k = 0; k < args.ne01; ++k) {
-        const float a = float(*((device const T0 *) (src0 + i03*args.nb03 + i02*args.nb02 +
-                                                    k*args.nb01 + i0*args.nb00)));
-        const float b = *((device const float *) (src1 + i3*args.nb13 + i2*args.nb12 +
-                                                  k*args.nb11 + i1*args.nb10));
-        sum += a*b;
+    const int tile_i0 = (sgitg & 3)*8;
+    const int tile_i1 = (sgitg >> 2)*8;
+    simdgroup_float8x8 sum = make_filled_simdgroup_matrix<float, 8>(0.0f);
+
+    for (int k0 = 0; k0 < args.ne01; k0 += tile_k) {
+        // Eight simdgroups cooperatively stage a 32x16 A tile and a 16x16 B
+        // tile. The asymmetric shape increases reuse for the typically large
+        // first output dimension of LoRA weight gradients.
+        for (int load = tiitg; load < tile_x*tile_k; load += 256) {
+            const int ti = load / tile_k;
+            const int tk = load % tile_k;
+            const int k = k0 + tk;
+            const int ai0 = base_i0 + ti;
+
+            if (ai0 < args.ne0 && k < args.ne01) {
+                tile_a[ti][tk] = float(*((device const T0 *)
+                    (src0 + i03*args.nb03 + i02*args.nb02 + k*args.nb01 + ai0*args.nb00)));
+            } else {
+                tile_a[ti][tk] = 0.0f;
+            }
+        }
+
+        for (int load = tiitg; load < tile_y*tile_k; load += 256) {
+            const int ti = load / tile_k;
+            const int tk = load % tile_k;
+            const int k = k0 + tk;
+            const int bi1 = base_i1 + ti;
+
+            if (bi1 < args.ne1 && k < args.ne01) {
+                tile_b[ti][tk] = *((device const float *)
+                    (src1 + i3*args.nb13 + i2*args.nb12 + k*args.nb11 + bi1*args.nb10));
+            } else {
+                tile_b[ti][tk] = 0.0f;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int kk = 0; kk < tile_k; kk += 8) {
+            simdgroup_float8x8 ma;
+            simdgroup_float8x8 mb;
+            simdgroup_load(ma, &tile_a[tile_i0][kk], tile_k + 1);
+            simdgroup_load(mb, &tile_b[tile_i1][kk], tile_k + 1, 0, true);
+            simdgroup_multiply_accumulate(sum, ma, mb, sum);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    *((device float *) (dst + i3*args.nb3 + i2*args.nb2 + i1*args.nb1 + i0*args.nb0)) = sum;
+    simdgroup_store(sum, &tile_c[tile_i0][tile_i1], tile_y + 1);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int store = tiitg; store < tile_x*tile_y; store += 256) {
+        const int li0 = store / tile_y;
+        const int li1 = store % tile_y;
+        const int i0 = base_i0 + li0;
+        const int i1 = base_i1 + li1;
+        if (i0 < args.ne0 && i1 < args.ne1) {
+            *((device float *) (dst + i3*args.nb3 + i2*args.nb2 + i1*args.nb1 + i0*args.nb0)) = tile_c[li0][li1];
+        }
+    }
 }
 
 typedef decltype(kernel_out_prod<float>) kernel_out_prod_t;

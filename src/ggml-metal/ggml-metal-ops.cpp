@@ -762,10 +762,12 @@ int ggml_metal_op_out_prod(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
 
-    const int tx = 8;
-    const int ty = 8;
-    const int tgx = (ne0 + tx - 1) / tx;
-    const int tgy = (ne1 + ty - 1) / ty;
+    const int tile_x = 32;
+    const int tile_y = 16;
+    const int tx = 256;
+    const int ty = 1;
+    const int tgx = (ne0 + tile_x - 1) / tile_x;
+    const int tgy = (ne1 + tile_y - 1) / tile_y;
 
     ggml_metal_encoder_dispatch_threadgroups(enc, tgx, tgy, ne2*ne3, tx, ty, 1);
 
