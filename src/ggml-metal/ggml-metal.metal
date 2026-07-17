@@ -1289,67 +1289,74 @@ kernel void kernel_bin_fuse_impl(
         const int i12 = i02%args.ne12;
         const int i11 = i01%args.ne11;
 
-        device const T0 * src0_ptr = (device const T0 *) (src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01 + args.offs);
-        device       T  * dst_ptr  = (device       T  *) (dst  + i03*args.nb3  + i02*args.nb2  + i01*args.nb1  + args.offs);
+        device const char * src0_ptr = src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01 + args.offs;
+        device       char * dst_ptr  = dst  + i03*args.nb3  + i02*args.nb2  + i01*args.nb1  + args.offs;
+
+        const uint step0 = sizeof(T0)/sizeof(float);
+        const uint step1 = sizeof(T1)/sizeof(float);
+        const uint step  = sizeof(T )/sizeof(float);
 
         if (FC_F == 1) {
-            device const T1 * src1_ptr = (device const T1 *) (src1 + args.o1[0] + i13*args.nb13 + i12*args.nb12 + i11*args.nb11);
+            device const char * src1_ptr = src1 + args.o1[0] + i13*args.nb13 + i12*args.nb12 + i11*args.nb11;
 
             for (int i0 = tpitg.x; i0 < args.ne0; i0 += ntg.x) {
                 const int i10 = FC_CB ? i0%args.ne10 : i0;
+                const T0 x0 = *((device const T0 *) (src0_ptr + i0*args.nb00*step0));
+                const T1 x1 = *((device const T1 *) (src1_ptr + i10*args.nb10*step1));
+                device T * out = (device T *) (dst_ptr + i0*args.nb0*step);
 
                 if (FC_OP == 0) {
-                    dst_ptr[i0] = src0_ptr[i0] + src1_ptr[i10];
+                    *out = x0 + x1;
                 }
 
                 if (FC_OP == 1) {
-                    dst_ptr[i0] = src0_ptr[i0] - src1_ptr[i10];
+                    *out = x0 - x1;
                 }
 
                 if (FC_OP == 2) {
-                    dst_ptr[i0] = src0_ptr[i0] * src1_ptr[i10];
+                    *out = x0 * x1;
                 }
 
                 if (FC_OP == 3) {
-                    dst_ptr[i0] = src0_ptr[i0] / src1_ptr[i10];
+                    *out = x0 / x1;
                 }
             }
         } else {
-            device const T1 * src1_ptr[8];
+            device const char * src1_ptr[8];
             FOR_UNROLL (short j = 0; j < FC_F; ++j) {
-                src1_ptr[j] = (device const T1 *) (src1 + args.o1[j] + i13*args.nb13 + i12*args.nb12 + i11*args.nb11);
+                src1_ptr[j] = src1 + args.o1[j] + i13*args.nb13 + i12*args.nb12 + i11*args.nb11;
             }
 
             for (int i0 = tpitg.x; i0 < args.ne0; i0 += ntg.x) {
                 const int i10 = FC_CB ? i0%args.ne10 : i0;
 
-                T res = src0_ptr[i0];
+                T res = *((device const T0 *) (src0_ptr + i0*args.nb00*step0));
 
                 if (FC_OP == 0) {
                     FOR_UNROLL (short j = 0; j < FC_F; ++j) {
-                        res += src1_ptr[j][i10];
+                        res += *((device const T1 *) (src1_ptr[j] + i10*args.nb10*step1));
                     }
                 }
 
                 if (FC_OP == 1) {
                     FOR_UNROLL (short j = 0; j < FC_F; ++j) {
-                        res -= src1_ptr[j][i10];
+                        res -= *((device const T1 *) (src1_ptr[j] + i10*args.nb10*step1));
                     }
                 }
 
                 if (FC_OP == 2) {
                     FOR_UNROLL (short j = 0; j < FC_F; ++j) {
-                        res *= src1_ptr[j][i10];
+                        res *= *((device const T1 *) (src1_ptr[j] + i10*args.nb10*step1));
                     }
                 }
 
                 if (FC_OP == 3) {
                     FOR_UNROLL (short j = 0; j < FC_F; ++j) {
-                        res /= src1_ptr[j][i10];
+                        res /= *((device const T1 *) (src1_ptr[j] + i10*args.nb10*step1));
                     }
                 }
 
-                dst_ptr[i0] = res;
+                *((device T *) (dst_ptr + i0*args.nb0*step)) = res;
             }
         }
     }
@@ -1425,6 +1432,210 @@ template [[host_name("kernel_repeat_bf16")]] kernel kernel_repeat_t kernel_repea
 #endif
 template [[host_name("kernel_repeat_i32")]] kernel kernel_repeat_t kernel_repeat<int>;
 template [[host_name("kernel_repeat_i16")]] kernel kernel_repeat_t kernel_repeat<short>;
+
+kernel void kernel_repeat_back_f32(
+        constant ggml_metal_kargs_repeat & args,
+        device const char * src0,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int i3 = tgpig.z;
+    const int i2 = tgpig.y;
+    const int i1 = tgpig.x;
+
+    for (int i0 = tpitg.x; i0 < args.ne0; i0 += ntg.x) {
+        float sum = 0.0f;
+
+        for (int i03 = i3; i03 < args.ne03; i03 += args.ne3) {
+            for (int i02 = i2; i02 < args.ne02; i02 += args.ne2) {
+                for (int i01 = i1; i01 < args.ne01; i01 += args.ne1) {
+                    for (int i00 = i0; i00 < args.ne00; i00 += args.ne0) {
+                        sum += *((device const float *) (src0 + i03*args.nb03 + i02*args.nb02 +
+                                                        i01*args.nb01 + i00*args.nb00));
+                    }
+                }
+            }
+        }
+
+        *((device float *) (dst + i3*args.nb3 + i2*args.nb2 + i1*args.nb1 + i0*args.nb0)) = sum;
+    }
+}
+
+template<typename T0>
+kernel void kernel_out_prod(
+        constant ggml_metal_kargs_out_prod & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiitg[[thread_index_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
+    constexpr int tile_x = 32;
+    constexpr int tile_y = 16;
+    constexpr int tile_k = 16;
+    threadgroup float tile_a[tile_x][tile_k + 1];
+    threadgroup float tile_b[tile_y][tile_k + 1];
+    threadgroup float tile_c[tile_x][tile_y + 1];
+
+    const int base_i0 = tgpig.x*tile_x;
+    const int base_i1 = tgpig.y*tile_y;
+
+    const int i2 = tgpig.z % args.ne2;
+    const int i3 = tgpig.z / args.ne2;
+    const int r2 = args.ne2 / args.ne02;
+    const int r3 = args.ne3 / args.ne03;
+    const int i02 = i2 / r2;
+    const int i03 = i3 / r3;
+
+    const int tile_i0 = (sgitg & 3)*8;
+    const int tile_i1 = (sgitg >> 2)*8;
+    simdgroup_float8x8 sum = make_filled_simdgroup_matrix<float, 8>(0.0f);
+
+    for (int k0 = 0; k0 < args.ne01; k0 += tile_k) {
+        // Eight simdgroups cooperatively stage a 32x16 A tile and a 16x16 B
+        // tile. The asymmetric shape increases reuse for the typically large
+        // first output dimension of LoRA weight gradients.
+        for (int load = tiitg; load < tile_x*tile_k; load += 256) {
+            const int ti = load / tile_k;
+            const int tk = load % tile_k;
+            const int k = k0 + tk;
+            const int ai0 = base_i0 + ti;
+
+            if (ai0 < args.ne0 && k < args.ne01) {
+                tile_a[ti][tk] = float(*((device const T0 *)
+                    (src0 + i03*args.nb03 + i02*args.nb02 + k*args.nb01 + ai0*args.nb00)));
+            } else {
+                tile_a[ti][tk] = 0.0f;
+            }
+        }
+
+        for (int load = tiitg; load < tile_y*tile_k; load += 256) {
+            const int ti = load / tile_k;
+            const int tk = load % tile_k;
+            const int k = k0 + tk;
+            const int bi1 = base_i1 + ti;
+
+            if (bi1 < args.ne1 && k < args.ne01) {
+                tile_b[ti][tk] = *((device const float *)
+                    (src1 + i3*args.nb13 + i2*args.nb12 + k*args.nb11 + bi1*args.nb10));
+            } else {
+                tile_b[ti][tk] = 0.0f;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int kk = 0; kk < tile_k; kk += 8) {
+            simdgroup_float8x8 ma;
+            simdgroup_float8x8 mb;
+            simdgroup_load(ma, &tile_a[tile_i0][kk], tile_k + 1);
+            simdgroup_load(mb, &tile_b[tile_i1][kk], tile_k + 1, 0, true);
+            simdgroup_multiply_accumulate(sum, ma, mb, sum);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    simdgroup_store(sum, &tile_c[tile_i0][tile_i1], tile_y + 1);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int store = tiitg; store < tile_x*tile_y; store += 256) {
+        const int li0 = store / tile_y;
+        const int li1 = store % tile_y;
+        const int i0 = base_i0 + li0;
+        const int i1 = base_i1 + li1;
+        if (i0 < args.ne0 && i1 < args.ne1) {
+            *((device float *) (dst + i3*args.nb3 + i2*args.nb2 + i1*args.nb1 + i0*args.nb0)) = tile_c[li0][li1];
+        }
+    }
+}
+
+typedef decltype(kernel_out_prod<float>) kernel_out_prod_t;
+
+template [[host_name("kernel_out_prod_f32_f32")]] kernel kernel_out_prod_t kernel_out_prod<float>;
+template [[host_name("kernel_out_prod_f16_f32")]] kernel kernel_out_prod_t kernel_out_prod<half>;
+
+template<typename T>
+kernel void kernel_silu_back(
+        constant ggml_metal_kargs_sum & args,
+        device const char * grad,
+        device const char * x,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const uint64_t i = uint64_t(tgpig.x)*ntg.x + tpitg.x;
+    if (i >= args.np) {
+        return;
+    }
+
+    const float xf = float(((device const T *) x)[i]);
+    const float s = 1.0f/(1.0f + exp(-xf));
+    ((device T *) dst)[i] = T(float(((device const T *) grad)[i])*s*(1.0f + xf*(1.0f - s)));
+}
+
+typedef decltype(kernel_silu_back<float>) kernel_silu_back_t;
+
+template [[host_name("kernel_silu_back_f32")]] kernel kernel_silu_back_t kernel_silu_back<float>;
+template [[host_name("kernel_silu_back_f16")]] kernel kernel_silu_back_t kernel_silu_back<half>;
+
+kernel void kernel_rms_norm_back_f32(
+        constant ggml_metal_kargs_norm & args,
+        device const char * grad,
+        device const char * x,
+        device       char * dst,
+        threadgroup float * shmem_f32 [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    if (sgitg == 0) {
+        shmem_f32[tiisg]      = 0.0f;
+        shmem_f32[32 + tiisg] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int i1 = tgpig.x;
+    const int i2 = tgpig.y;
+    const int i3 = tgpig.z;
+
+    device const float * grad_row = (device const float *)
+        (grad + i3*args.nbf3[0] + i2*args.nbf2[0] + i1*args.nbf1[0]);
+    device const float * x_row = (device const float *)
+        (x + i3*args.nbf3[1] + i2*args.nbf2[1] + i1*args.nbf1[1]);
+    device float * dst_row = (device float *)
+        (dst + i3*args.nb3 + i2*args.nb2 + i1*args.nb1);
+
+    float sum_xx = 0.0f;
+    float sum_xg = 0.0f;
+    for (int i0 = tpitg.x; i0 < args.ne00; i0 += ntg.x) {
+        const float xf = x_row[i0];
+        sum_xx += xf*xf;
+        sum_xg += xf*grad_row[i0];
+    }
+
+    sum_xx = simd_sum(sum_xx);
+    sum_xg = simd_sum(sum_xg);
+
+    if (tiisg == 0) {
+        shmem_f32[sgitg]      = sum_xx;
+        shmem_f32[32 + sgitg] = sum_xg;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    sum_xx = simd_sum(shmem_f32[tiisg]);
+    sum_xg = simd_sum(shmem_f32[32 + tiisg]);
+
+    const float mean_eps = sum_xx/args.ne00 + args.eps;
+    const float rrms = 1.0f/sqrt(mean_eps);
+    const float scale_x = -sum_xg/(sum_xx + args.ne00*args.eps);
+
+    for (int i0 = tpitg.x; i0 < args.ne00; i0 += ntg.x) {
+        dst_row[i0] = (grad_row[i0] + x_row[i0]*scale_x)*rrms;
+    }
+}
 
 template<typename T>
 kernel void kernel_reglu(
@@ -1891,6 +2102,31 @@ template [[host_name("kernel_tri_bf16_1")]] kernel kernel_tri_t kernel_tri<bfloa
 template [[host_name("kernel_tri_bf16_2")]] kernel kernel_tri_t kernel_tri<bfloat, 2>;
 template [[host_name("kernel_tri_bf16_3")]] kernel kernel_tri_t kernel_tri<bfloat, 3>;
 #endif
+
+kernel void kernel_soft_max_back_f32(
+        constant ggml_metal_kargs_soft_max_back & args,
+        device const char * grad,
+        device const char * y,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]]) {
+    device const float * grad_row = (device const float *)
+        (grad + tgpig.x*args.nb01 + tgpig.y*args.nb02 + tgpig.z*args.nb03);
+    device const float * y_row = (device const float *)
+        (y + tgpig.x*args.nb11 + tgpig.y*args.nb12 + tgpig.z*args.nb13);
+    device float * dst_row = (device float *)
+        (dst + tgpig.x*args.nb1 + tgpig.y*args.nb2 + tgpig.z*args.nb3);
+
+    float dot_yg = 0.0f;
+    for (int i0 = tpitg.x; i0 < args.ne00; i0 += 32) {
+        dot_yg += y_row[i0]*grad_row[i0];
+    }
+    dot_yg = simd_sum(dot_yg);
+
+    for (int i0 = tpitg.x; i0 < args.ne00; i0 += 32) {
+        dst_row[i0] = args.scale*(grad_row[i0] - dot_yg)*y_row[i0];
+    }
+}
 
 template<typename T>
 kernel void kernel_soft_max(
