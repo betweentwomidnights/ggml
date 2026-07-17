@@ -9125,6 +9125,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                               65, 17, 23, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_out_prod(GGML_TYPE_F16, GGML_TYPE_F32,
                                               65, 17, 23, {1, 1}, {1, 1}, true));
+    // Frozen cross-attention projection backward used by SA3 Metal training.
+    test_cases.emplace_back(new test_out_prod(GGML_TYPE_F16, GGML_TYPE_F32,
+                                              1024, 257, 2048, {1, 1}, {1, 1}, true));
     test_cases.emplace_back(new test_lora_zero_b());
 
     // add_id
@@ -9443,6 +9446,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 1, 1}, {256, 16, 1, 1}, -1));
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {256, 16, 2, 3}, -1));
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {128, 16, 2, 3}, -1));
+    test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {2048, 257, 1, 1}, {1024, 257, 1, 1}, -1));
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {256, 16, 2, 3}, 1));
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {128, 16, 2, 3}, 2));
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {64, 16, 2, 3}, 3));
