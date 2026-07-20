@@ -1187,6 +1187,16 @@ enum ggml_type gguf_get_tensor_type(const struct gguf_context * ctx, int64_t ten
     return ctx->info[tensor_id].t.type;
 }
 
+int gguf_get_tensor_ndims(const struct gguf_context * ctx, int64_t tensor_id) {
+    GGML_ASSERT(tensor_id >= 0 && tensor_id < gguf_get_n_tensors(ctx));
+    return ggml_n_dims(&ctx->info[tensor_id].t);
+}
+
+const int64_t * gguf_get_tensor_ne(const struct gguf_context * ctx, int64_t tensor_id) {
+    GGML_ASSERT(tensor_id >= 0 && tensor_id < gguf_get_n_tensors(ctx));
+    return ctx->info[tensor_id].t.ne;
+}
+
 size_t gguf_get_tensor_size(const struct gguf_context * ctx, int64_t tensor_id) {
     GGML_ASSERT(tensor_id >= 0 && tensor_id < gguf_get_n_tensors(ctx));
     return ggml_nbytes(&ctx->info[tensor_id].t);

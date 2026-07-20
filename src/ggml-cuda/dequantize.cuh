@@ -1,5 +1,16 @@
 #include "common.cuh"
 
+// Unpack the per-group scale (d) and min (m) from a Q4_K scales array.
+// Used by the k-quant get_rows per-element dequantize wrappers and convert.cu.
+static inline __device__ void get_scale_min_k4(int j, const uint8_t * q, uint8_t & d, uint8_t & m) {
+    if (j < 4) {
+        d = q[j] & 63; m = q[j + 4] & 63;
+    } else {
+        d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        m = (q[j + 4] >>  4) | ((q[j - 0] >> 6) << 4);
+    }
+}
+
 static __device__ __forceinline__ void dequantize_q1_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_q1_0 * x = (const block_q1_0 *) vx;
 
