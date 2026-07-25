@@ -266,24 +266,25 @@ static __device__ void dequantize_q4_K_elem(const void * vx, int64_t ib, int iqs
 
 static __device__ void dequantize_q5_K_elem(const void * vx, int64_t ib, int iqs, float2 & v) {
     const block_q5_K * x = (const block_q5_K *) vx;
-    const int il = iqs / 64;           // 0..3
+    const int il      = iqs / 64;      // 0..3   -> which 64-element quarter
     const int e_local = iqs % 64;      // 0..63
-    const int group = e_local / 32;    // 0=low, 1=high
-    const int ir = (e_local % 32) / 2; // 0..15
-    const int sub = e_local % 2;       // 0 or 1
-    const int quant_idx = 32 * il + 2 * ir + sub;
-    const int j = 2 * il + group;      // scale index
+    const int group   = e_local / 32;  // 0 = low nibble, 1 = high nibble
+    const int rem     = e_local % 32;  // 0..31  -> position within the nibble half
+    const int j       = 2 * il + group;                                 // scale index 0..7
     uint8_t sc, mn;
     get_scale_min_k4(j, x[ib].scales, sc, mn);
     const float dall = __low2half(x[ib].dm);
     const float dmin = __high2half(x[ib].dm);
     const float d = dall * sc;
     const float m = dmin * mn;
-    const uint8_t ql = x[ib].qs[quant_idx];
-    const uint8_t hm = 1 << (2 * il);
-    const uint8_t qh = (x[ib].qh[quant_idx / 8] >> (quant_idx % 8)) & 1;
-    const int qval = (ql & 0xF) | ((group == 0 ? (qh & hm) : (qh & (hm << 1))) ? 16 : 0);
-    v.x = d * qval - m;
+    // qs holds two 4-bit quants per byte: low nibbles cover group 0, high nibbles group 1.
+    const uint8_t ql = x[ib].qs[32 * il + rem];
+    const int lo = group == 0 ? (ql & 0xF) : (ql >> 4);
+    // qh is a flat 256-bit plane (32 bytes): byte `rem`, bit `2*il + group` is this
+    // element's 5th bit. Matches dequantize_block_q5_K, where qh is indexed by the
+    // in-half position only and the bit is picked by hm = 1 << (2*il), hm <<= 1.
+    const int hi = (x[ib].qh[rem] >> j) & 1;
+    v.x = d * (lo + (hi ? 16 : 0)) - m;
     v.y = 0;
 }
 
