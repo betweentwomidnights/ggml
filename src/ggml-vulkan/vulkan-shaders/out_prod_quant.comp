@@ -1,0 +1,139 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+#include "types.glsl"
+#include "generic_binary_head.glsl"
+#include "dequant_funcs.glsl"
+
+// Quantized-src0 OUT_PROD:
+//   dst[i0, i1] = sum_k src0[i0, k] * src1[i1, k]
+//
+// Same tiled structure as out_prod.comp -- see there for why 16x16 tiles and a 64-thread
+// workgroup. The only difference is the tile_a load: src0 is a block-quantized buffer, so an
+// element cannot be indexed directly and has to be dequantized out of its block.
+//
+// This exists because the backward of mul_mat is out_prod(W, transpose(grad)). With W quantized
+// that is the one op standing between a quantized base model and LoRA training on it -- the
+// forward already works, since the functional adapter path only ever passes W to mul_mat.
+const uint TILE = 16;
+const uint WORKGROUP = 8;
+
+layout(local_size_x = WORKGROUP, local_size_y = WORKGROUP, local_size_z = 1) in;
+
+shared float tile_a[TILE][TILE + 1];
+shared float tile_b[TILE][TILE + 1];
+
+// One element of a block-quantized row.
+//
+// dequantize() hands back a PAIR, and which two elements that pair holds depends on QUANT_R --
+// the same convention get_rows_quant.comp encodes as `y_offset = QUANT_R == 1 ? 1 : QUANT_K/2`:
+//
+//   QUANT_R == 1  the pair is (iqs, iqs+1), consecutive, and iqs must be EVEN. The k-quants live
+//                 here and divide iqs by two internally, so an odd iqs silently reads the wrong
+//                 pair -- which is exactly the bug this comment exists to stop someone rewriting.
+//                 Q8_0 is forgiving (its .x is element iqs for any iqs) but must not be the model.
+//   QUANT_R == 2  the block is two interleaved halves, so the pair is (iqs, iqs + QUANT_K/2) and
+//                 element e < QUANT_K/2 is .x of pair e, e >= QUANT_K/2 is .y of pair e-QUANT_K/2.
+//
+// Dequantizing a pair to keep one value is wasteful, but the cooperative tile load below amortises
+// it and correctness comes first; a pair-aware load is a later optimisation.
+float dequant_elem(const uint row_block_base, const uint e) {
+    const uint blk = e / QUANT_K;          // which block within the row
+    const uint eb  = e % QUANT_K;          // element within that block
+    const uint ib  = row_block_base + blk;
+
+    uint iqs;
+    bool hi;
+    if (QUANT_R == 1) {
+        iqs = eb & ~1u;                    // pair base: must be even
+        hi  = (eb & 1u) != 0u;             // odd element is the pair's second half
+    } else {
+        const uint half_k = QUANT_K / 2;
+        hi  = eb >= half_k;
+        iqs = hi ? (eb - half_k) : eb;
+    }
+
+    vec2 v = dequantize(ib, iqs, 0);
+    const vec2 dm = get_dm(ib, 0);         // (1,0) where dequantize already applied the scale
+    v = v * dm.x + dm.y;
+    return hi ? v.y : v.x;
+}
+
+void main() {
+#ifdef NEEDS_INIT_IQ_SHMEM
+    init_iq_shmem(gl_WorkGroupSize);
+#endif
+
+    const uint lx = gl_LocalInvocationID.x;
+    const uint ly = gl_LocalInvocationID.y;
+    const uint local_idx = ly * WORKGROUP + lx;
+    const uint base_i0 = gl_WorkGroupID.x * TILE;
+    const uint base_i1 = gl_WorkGroupID.y * TILE;
+    const uint i00 = base_i0 + lx;
+    const uint i01 = base_i0 + lx + WORKGROUP;
+    const uint i10 = base_i1 + ly;
+    const uint i11 = base_i1 + ly + WORKGROUP;
+    const uint batch = gl_WorkGroupID.z;
+    const uint i2 = batch % p.ne22;
+    const uint i3 = batch / p.ne22;
+
+    const uint r2 = p.ne22 / p.ne02;
+    const uint r3 = p.ne23 / p.ne03;
+    const uint a2 = i2 / r2;
+    const uint a3 = i3 / r3;
+
+    float sum00 = 0.0;
+    float sum01 = 0.0;
+    float sum10 = 0.0;
+    float sum11 = 0.0;
+    for (uint k0 = 0; k0 < p.ne01; k0 += TILE) {
+        [[unroll]] for (uint load = local_idx; load < TILE*TILE; load += WORKGROUP*WORKGROUP) {
+            const uint tk = load / TILE;
+            const uint ti = load % TILE;
+            const uint k = k0 + tk;
+            const uint ai0 = base_i0 + ti;
+            const uint bi1 = base_i1 + ti;
+
+            if (ai0 < p.ne20 && k < p.ne01) {
+                // For a quantized src0 the strides are block-based, so this is the row's first
+                // block rather than its first element.
+                const uint row_block_base = get_aoffset() + a3*p.nb03 + a2*p.nb02 + k*p.nb01;
+                tile_a[tk][ti] = dequant_elem(row_block_base, ai0);
+            } else {
+                tile_a[tk][ti] = 0.0;
+            }
+
+            if (bi1 < p.ne21 && k < p.ne01) {
+                const uint bi = i3*p.nb13 + i2*p.nb12 + k*p.nb11 + bi1*p.nb10;
+                tile_b[tk][ti] = float(data_b[get_boffset() + bi]);
+            } else {
+                tile_b[tk][ti] = 0.0;
+            }
+        }
+
+        barrier();
+
+        [[unroll]] for (uint kk = 0; kk < TILE; ++kk) {
+            const float a0 = tile_a[kk][lx];
+            const float a1 = tile_a[kk][lx + WORKGROUP];
+            const float b0 = tile_b[kk][ly];
+            const float b1 = tile_b[kk][ly + WORKGROUP];
+            sum00 += a0 * b0;
+            sum01 += a0 * b1;
+            sum10 += a1 * b0;
+            sum11 += a1 * b1;
+        }
+
+        barrier();
+    }
+
+    if (i00 < p.ne20 && i10 < p.ne21)
+        data_d[get_doffset() + dst_idx(i00, i10, i2, i3)] = D_TYPE(sum00);
+    if (i00 < p.ne20 && i11 < p.ne21)
+        data_d[get_doffset() + dst_idx(i00, i11, i2, i3)] = D_TYPE(sum01);
+    if (i01 < p.ne20 && i10 < p.ne21)
+        data_d[get_doffset() + dst_idx(i01, i10, i2, i3)] = D_TYPE(sum10);
+    if (i01 < p.ne20 && i11 < p.ne21)
+        data_d[get_doffset() + dst_idx(i01, i11, i2, i3)] = D_TYPE(sum11);
+}

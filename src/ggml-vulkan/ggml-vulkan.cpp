@@ -806,6 +806,11 @@ struct vk_device_struct {
     vk_pipeline pipeline_set_f32;
     vk_pipeline pipeline_out_prod_f32;
     vk_pipeline pipeline_out_prod_f16;
+    // quantized src0, for the mul_mat backward against a frozen quantized weight
+    vk_pipeline pipeline_out_prod_q4_k;
+    vk_pipeline pipeline_out_prod_q5_k;
+    vk_pipeline pipeline_out_prod_q6_k;
+    vk_pipeline pipeline_out_prod_q8_0;
 
     // [src0 0=fp32,1=fp16][src1 0=fp32,1=fp16][dst 0=fp32,1=fp16]
     vk_pipeline pipeline_add[2][2][2];
@@ -5206,6 +5211,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_set_f32, "set_f32", acc_f32_len, acc_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {0, 0}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_out_prod_f32, "out_prod_f32", out_prod_f32_len, out_prod_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {16, 16, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_out_prod_f16, "out_prod_f16", out_prod_f16_len, out_prod_f16_data, "main", 3, sizeof(vk_op_binary_push_constants), {16, 16, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_out_prod_q4_k, "out_prod_q4_k", out_prod_q4_k_len, out_prod_q4_k_data, "main", 3, sizeof(vk_op_binary_push_constants), {16, 16, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_out_prod_q5_k, "out_prod_q5_k", out_prod_q5_k_len, out_prod_q5_k_data, "main", 3, sizeof(vk_op_binary_push_constants), {16, 16, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_out_prod_q6_k, "out_prod_q6_k", out_prod_q6_k_len, out_prod_q6_k_data, "main", 3, sizeof(vk_op_binary_push_constants), {16, 16, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_out_prod_q8_0, "out_prod_q8_0", out_prod_q8_0_len, out_prod_q8_0_data, "main", 3, sizeof(vk_op_binary_push_constants), {16, 16, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_concat_i8, "concat_i8", concat_i8_len, concat_i8_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_concat_i16, "concat_i16", concat_i16_len, concat_i16_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
@@ -10569,6 +10578,13 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         if (src0->type == GGML_TYPE_F16) {
             return ctx->device->pipeline_out_prod_f16;
         }
+        switch (src0->type) {
+            case GGML_TYPE_Q4_K: return ctx->device->pipeline_out_prod_q4_k;
+            case GGML_TYPE_Q5_K: return ctx->device->pipeline_out_prod_q5_k;
+            case GGML_TYPE_Q6_K: return ctx->device->pipeline_out_prod_q6_k;
+            case GGML_TYPE_Q8_0: return ctx->device->pipeline_out_prod_q8_0;
+            default: break;
+        }
         return nullptr;
     case GGML_OP_ADD:
     case GGML_OP_SUB:
@@ -11349,7 +11365,9 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     }
     std::cerr << "), (" << dst << ", name=" << dst->name << ", type=" << dst->type << ", ne0=" << dst->ne[0] << ", ne1=" << dst->ne[1] << ", ne2=" << dst->ne[2] << ", ne3=" << dst->ne[3] << ", nb0=" << dst->nb[0] << ", nb1=" << dst->nb[1] << ", nb2=" << dst->nb[2] << ", nb3=" << dst->nb[3];
     std::cerr << "), " << ggml_op_name(op) << ")");
-    GGML_ASSERT(op == GGML_OP_GET_ROWS || op == GGML_OP_CPY || (!ggml_is_quantized(src0->type) && (src1 == nullptr || !ggml_is_quantized(src1->type))));  // NOLINT
+    // OUT_PROD joins GET_ROWS and CPY as an op whose src0 may be quantized: its shader dequantizes
+    // inline, for the mul_mat backward against a frozen quantized weight.
+    GGML_ASSERT(op == GGML_OP_GET_ROWS || op == GGML_OP_CPY || op == GGML_OP_OUT_PROD || (!ggml_is_quantized(src0->type) && (src1 == nullptr || !ggml_is_quantized(src1->type))));  // NOLINT
     GGML_ASSERT(dst->buffer != nullptr);
     const uint64_t ne00 = src0->ne[0];
     const uint64_t ne01 = src0->ne[1];
@@ -11765,7 +11783,9 @@ static void ggml_vk_acc(ggml_backend_vk_context * ctx, vk_context& subctx, const
 }
 
 static void ggml_vk_out_prod(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 ||
+                src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K ||
+                src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
     GGML_ASSERT(src0->ne[1] == src1->ne[1]);
@@ -17600,7 +17620,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_ACC:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_OUT_PROD:
-            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
+            // Quantized src0 is the mul_mat backward against a frozen quantized weight, i.e. LoRA
+            // training on a quantized base. Only the k-quants with a validated shader variant.
+            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16 ||
+                    op->src[0]->type == GGML_TYPE_Q4_K || op->src[0]->type == GGML_TYPE_Q5_K ||
+                    op->src[0]->type == GGML_TYPE_Q6_K || op->src[0]->type == GGML_TYPE_Q8_0) &&
                    op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_SET:
             return op->src[0]->type == op->src[1]->type && op->src[0]->type == op->type &&
