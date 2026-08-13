@@ -2074,7 +2074,14 @@ int ggml_metal_op_set(ggml_metal_op_t ctx, int idx) {
 
         const int nth = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), ne00);
 
-        ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, nth, 1, 1);
+        // kernel_cpy_t_t derives its row-chunk index as tgpig[0]/ne01 and copies exactly one
+        // element per thread, so the grid must carry ceil(ne00/nth) chunks per row. Dispatching
+        // only ne01 threadgroups pins that index at 0 and silently truncates every row at nth
+        // elements -- invisible until ne00 exceeds the threadgroup limit (1024 on Apple GPUs).
+        // Same nw0 factor ggml_metal_op_cpy already applies.
+        const int nw0 = (ne00 + nth - 1)/nth;
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, nw0*ne01, ne02, ne03, nth, 1, 1);
 
         ggml_metal_op_concurrency_reset(ctx);
     }
