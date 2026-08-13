@@ -866,6 +866,16 @@ void process_shaders() {
     string_to_spv("out_prod_f32", "out_prod.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}});
     string_to_spv("out_prod_f16", "out_prod.comp", {{"A_TYPE", "float16_t"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}});
 
+    // Quantized src0, for the mul_mat backward against a quantized (frozen) weight -- i.e. LoRA
+    // training on a quantized base. Scoped to the k-quants a q4_k_m / q5_k_m / q8_0 mix actually
+    // produces rather than the whole type table: each one needs validating against the CPU
+    // reference, and shipping untested variants would be worse than not shipping them.
+    for (const auto& tname : {std::string("q4_k"), std::string("q5_k"), std::string("q6_k"), std::string("q8_0")}) {
+        const std::string data_a_key = "DATA_A_" + to_uppercase(tname);
+        string_to_spv("out_prod_" + tname, "out_prod_quant.comp",
+                      {{data_a_key, "1"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}});
+    }
+
     string_to_spv("split_k_reduce", "mul_mat_split_k_reduce.comp", {});
     string_to_spv("fa_split_k_reduce", "flash_attn_split_k_reduce.comp", {});
 
