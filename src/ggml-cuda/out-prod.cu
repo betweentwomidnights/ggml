@@ -31,7 +31,9 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
-    GGML_ASSERT(src0->type == GGML_TYPE_F32 || (src0->type == GGML_TYPE_F16 && ggml_is_contiguous(src0)));
+    // Anything that is not already f32 goes through the dequantize-to-pool path below, which reads
+    // src0 as a flat run of rows and so needs it contiguous.
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || ggml_is_contiguous(src0));
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
 
@@ -51,15 +53,18 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     cudaStream_t   stream = ctx.stream();
     cublasHandle_t handle = ctx.cublas_handle();
 
-    // Non-f32 src0 (frozen f16 weights in training graphs): convert to a transient pool buffer.
+    // Non-f32 src0: convert to a transient pool buffer. Frozen f16 weights in training graphs, and
+    // now also quantized ones -- the backward of mul_mat is out_prod(W, transpose(grad)), so this
+    // is what lets a LoRA train against a quantized frozen base. ggml_get_to_fp32_cuda covers every
+    // k-quant, so no new kernel is needed here.
     // Unlike an explicit f32 cast in the graph, this copy only lives for the duration of this op,
-    // so a graph full of adapted f16 weights doesn't hold a full f32 weight copy resident.
+    // so a graph full of adapted weights doesn't hold a full f32 weight copy resident.
     ggml_cuda_pool_alloc<float> src0_f32(ctx.pool());
     const float * src0_d;
     int64_t lda = nb01 / sizeof(float);
     size_t  s02 = nb02 / sizeof(float);
     size_t  s03 = nb03 / sizeof(float);
-    if (src0->type == GGML_TYPE_F16) {
+    if (src0->type != GGML_TYPE_F32) {
         const int64_t n = ggml_nelements(src0);
         src0_f32.alloc(n);
         const to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(src0->type);

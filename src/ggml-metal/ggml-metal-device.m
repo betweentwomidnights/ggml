@@ -1160,7 +1160,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                    op->type == GGML_TYPE_F32 &&
                    ggml_can_repeat(op, op->src[0]);
         case GGML_OP_OUT_PROD:
-            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
+            return ggml_metal_op_out_prod_supports_src0(op->src[0]->type) &&
                    op->src[1]->type == GGML_TYPE_F32 &&
                    op->type == GGML_TYPE_F32 &&
                    op->src[0]->ne[1] == op->src[1]->ne[1] &&
