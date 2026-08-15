@@ -8869,6 +8869,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Frozen cross-attention projection backward used by SA3 Metal training.
     test_cases.emplace_back(new test_out_prod(GGML_TYPE_F16, GGML_TYPE_F32,
                                               1024, 257, 2048, {1, 1}, {1, 1}, true));
+    // Training a LoRA on a quantized base reaches OUT_PROD with a quantized src0.
+    // base_types covers Q4_K and Q8_0 but not Q5_K or Q6_K, and a q4_k_m mix emits
+    // Q6_K for the tensors it keeps at higher precision, so name them explicitly.
+    for (ggml_type type_a : {GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        test_cases.emplace_back(new test_out_prod(type_a, GGML_TYPE_F32,
+                                                  256, 16, 16, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_out_prod(type_a, GGML_TYPE_F32,
+                                                  1024, 257, 2048, {1, 1}, {1, 1}, true));
+    }
     test_cases.emplace_back(new test_lora_zero_b());
 
     // add_id
