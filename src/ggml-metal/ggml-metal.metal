@@ -1610,6 +1610,132 @@ typedef decltype(kernel_out_prod<float>) kernel_out_prod_t;
 template [[host_name("kernel_out_prod_f32_f32")]] kernel kernel_out_prod_t kernel_out_prod<float>;
 template [[host_name("kernel_out_prod_f16_f32")]] kernel kernel_out_prod_t kernel_out_prod<half>;
 
+// OUT_PROD with a quantized src0, which is what the backward of mul_mat needs to
+// train a LoRA on a quantized base. Same structure as kernel_out_prod above —
+// keep the two in sync — with the A tile dequantized inline instead of read as a
+// typed element.
+//
+// The element mapping is the part worth reading twice. Metal's dequantize helpers
+// emit 16 values at a time and take a *group* index within the block, the
+// convention kernel_get_rows_q spells as dequantize_func(psrc + ind/nl, ind%nl),
+// where ind counts 16-element groups along ne00. Those 16 values are consecutive
+// along ne00, which is the axis tile_a's first index walks, so a work item here
+// stages a whole 16-wide run of one src0 row rather than a single element. Doing
+// it per element instead would repeat the block's scale unpack sixteen times, and
+// that unpack — not the element arithmetic — is what a k-quant costs.
+//
+// That 16-wide granularity is also why tile_k is 32 here and 16 there. A tile is
+// tile_x*tile_k/16 dequantize calls, so at tile_k = 16 only 32 of the 256 threads
+// stage A and the rest wait at the barrier; 32 puts 64 to work and measured 7%
+// faster end to end. 64 measured identical to 32 and costs 14.7 KiB of
+// threadgroup memory against 8.5 KiB, so it is not worth the occupancy.
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread float4x4 &)>
+kernel void kernel_out_prod_q(
+        constant ggml_metal_kargs_out_prod & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiitg[[thread_index_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
+    constexpr int tile_x = 32;
+    constexpr int tile_y = 16;
+    constexpr int tile_k = 32;
+    constexpr int run_a  = 16;             // elements one dequantize_func call emits
+    threadgroup float tile_a[tile_x][tile_k + 1];
+    threadgroup float tile_b[tile_y][tile_k + 1];
+    threadgroup float tile_c[tile_x][tile_y + 1];
+
+    const int base_i0 = tgpig.x*tile_x;
+    const int base_i1 = tgpig.y*tile_y;
+
+    const int i2 = tgpig.z % args.ne2;
+    const int i3 = tgpig.z / args.ne2;
+    const int r2 = args.ne2 / args.ne02;
+    const int r3 = args.ne3 / args.ne03;
+    const int i02 = i2 / r2;
+    const int i03 = i3 / r3;
+
+    const int tile_i0 = (sgitg & 3)*8;
+    const int tile_i1 = (sgitg >> 2)*8;
+    simdgroup_float8x8 sum = make_filled_simdgroup_matrix<float, 8>(0.0f);
+
+    for (int k0 = 0; k0 < args.ne01; k0 += tile_k) {
+        for (int load = tiitg; load < (tile_x/run_a)*tile_k; load += 256) {
+            const int tk  = load / (tile_x/run_a);
+            const int ti  = (load % (tile_x/run_a))*run_a;
+            const int k   = k0 + tk;
+            const int ai0 = base_i0 + ti;
+
+            if (ai0 < args.ne0 && k < args.ne01) {
+                device const block_q * prow = (device const block_q *)
+                    (src0 + i03*args.nb03 + i02*args.nb02 + k*args.nb01);
+
+                const int ig = ai0/run_a;  // 16-element group index within the row
+
+                float4x4 temp;
+                dequantize_func(prow + ig/nl, ig%nl, temp);
+
+                for (short j = 0; j < run_a; ++j) {
+                    tile_a[ti + j][tk] = ai0 + j < args.ne0 ? temp[j/4][j%4] : 0.0f;
+                }
+            } else {
+                for (short j = 0; j < run_a; ++j) {
+                    tile_a[ti + j][tk] = 0.0f;
+                }
+            }
+        }
+
+        for (int load = tiitg; load < tile_y*tile_k; load += 256) {
+            const int ti = load / tile_k;
+            const int tk = load % tile_k;
+            const int k = k0 + tk;
+            const int bi1 = base_i1 + ti;
+
+            if (bi1 < args.ne1 && k < args.ne01) {
+                tile_b[ti][tk] = *((device const float *)
+                    (src1 + i3*args.nb13 + i2*args.nb12 + k*args.nb11 + bi1*args.nb10));
+            } else {
+                tile_b[ti][tk] = 0.0f;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int kk = 0; kk < tile_k; kk += 8) {
+            simdgroup_float8x8 ma;
+            simdgroup_float8x8 mb;
+            simdgroup_load(ma, &tile_a[tile_i0][kk], tile_k + 1);
+            simdgroup_load(mb, &tile_b[tile_i1][kk], tile_k + 1, 0, true);
+            simdgroup_multiply_accumulate(sum, ma, mb, sum);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    simdgroup_store(sum, &tile_c[tile_i0][tile_i1], tile_y + 1);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int store = tiitg; store < tile_x*tile_y; store += 256) {
+        const int li0 = store / tile_y;
+        const int li1 = store % tile_y;
+        const int i0 = base_i0 + li0;
+        const int i1 = base_i1 + li1;
+        if (i0 < args.ne0 && i1 < args.ne1) {
+            *((device float *) (dst + i3*args.nb3 + i2*args.nb2 + i1*args.nb1 + i0*args.nb0)) = tile_c[li0][li1];
+        }
+    }
+}
+
+typedef decltype(kernel_out_prod_q<block_q8_0, 2, dequantize_q8_0>) kernel_out_prod_q_t;
+
+// Only the types a q4_k_m / q5_k_m / q8_0 mix actually produces. The rest of the
+// type table is deliberately left out until someone validates it.
+template [[host_name("kernel_out_prod_q8_0_f32")]] kernel kernel_out_prod_q_t kernel_out_prod_q<block_q8_0, 2,     dequantize_q8_0>;
+template [[host_name("kernel_out_prod_q4_K_f32")]] kernel kernel_out_prod_q_t kernel_out_prod_q<block_q4_K, QK_NL, dequantize_q4_K>;
+template [[host_name("kernel_out_prod_q5_K_f32")]] kernel kernel_out_prod_q_t kernel_out_prod_q<block_q5_K, QK_NL, dequantize_q5_K>;
+template [[host_name("kernel_out_prod_q6_K_f32")]] kernel kernel_out_prod_q_t kernel_out_prod_q<block_q6_K, QK_NL, dequantize_q6_K>;
+
 template<typename T>
 kernel void kernel_silu_back(
         constant ggml_metal_kargs_sum & args,
