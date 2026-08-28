@@ -1160,7 +1160,12 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                    op->type == GGML_TYPE_F32 &&
                    ggml_can_repeat(op, op->src[0]);
         case GGML_OP_OUT_PROD:
-            return ggml_metal_op_out_prod_supports_src0(op->src[0]->type) &&
+            // Both out_prod kernels stage their tiles through simdgroup_float8x8 with no scalar
+            // fallback, so a device below Apple7 (A13 and older, and the iOS simulator, which
+            // reports Apple2) cannot run them. Without this the op reported itself supported and
+            // then trapped on dispatch; declining lets the scheduler fall back to CPU instead.
+            return has_simdgroup_mm &&
+                   ggml_metal_op_out_prod_supports_src0(op->src[0]->type) &&
                    op->src[1]->type == GGML_TYPE_F32 &&
                    op->type == GGML_TYPE_F32 &&
                    op->src[0]->ne[1] == op->src[1]->ne[1] &&
@@ -1339,6 +1344,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                            case GGML_TYPE_BF16:
                            case GGML_TYPE_Q8_0:
                            case GGML_TYPE_Q1_0:
+                           case GGML_TYPE_Q2_0:
                            case GGML_TYPE_Q4_0:
                            case GGML_TYPE_Q4_1:
                            case GGML_TYPE_Q5_0:
@@ -1366,6 +1372,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                                 return false;
                         }
                     case GGML_TYPE_Q1_0:
+                    case GGML_TYPE_Q2_0:
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q5_0:
@@ -1388,7 +1395,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return op->src[0]->type != GGML_TYPE_NVFP4;
         case GGML_OP_SET_ROWS:
             {
-                if (op->src[0]->type != GGML_TYPE_F32 && op->src[0]->type != GGML_TYPE_F16) {
+                if (op->src[0]->type == GGML_TYPE_F16) {
+                    return op->type == GGML_TYPE_F16;
+                }
+
+                if (op->src[0]->type != GGML_TYPE_F32) {
                     return false;
                 }
 
