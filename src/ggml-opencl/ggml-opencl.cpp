@@ -258,7 +258,8 @@ static ADRENO_GPU_GEN get_adreno_gpu_gen(const char *device_name) {
         return ADRENO_GPU_GEN::A6X;
     }
 
-    if (strstr(device_name, "730") ||
+    if (strstr(device_name, "702") ||
+        strstr(device_name, "730") ||
         strstr(device_name, "740") ||
         strstr(device_name, "750")) {
         return ADRENO_GPU_GEN::A7X;
@@ -738,7 +739,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_soft_max, kernel_soft_max_4;
     cl_kernel kernel_soft_max_f16, kernel_soft_max_4_f16;
     ggml_opencl_fa_kernels fa;
-    cl_kernel kernel_get_rows_f32, kernel_get_rows_f16, kernel_get_rows_q4_0;
+    cl_kernel kernel_get_rows_f32, kernel_get_rows_f16, kernel_get_rows_q4_0, kernel_get_rows_q8_0_soa;
     cl_kernel kernel_set_rows_f32_i64, kernel_set_rows_f32_i32, kernel_set_rows_f16_i64, kernel_set_rows_f16_i32;
     cl_kernel kernel_set_rows_q8_0_i64, kernel_set_rows_q8_0_i32;
     cl_kernel kernel_set_rows_q8_0_soa_i64, kernel_set_rows_q8_0_soa_i32;
@@ -1023,7 +1024,26 @@ struct ggml_backend_opencl_context {
         }
 #else
         GGML_UNUSED(tensor);
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, NULL));
+        const cl_int enqueue_err = clEnqueueNDRangeKernel(
+            queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, NULL);
+        if (enqueue_err != CL_SUCCESS) {
+            char kernel_name[256] = {};
+            clGetKernelInfo(kernel, CL_KERNEL_FUNCTION_NAME, sizeof(kernel_name), kernel_name, nullptr);
+            GGML_LOG_ERROR("ggml_opencl: enqueue %s failed (%d), global=[%zu,%zu,%zu], local=[%zu,%zu,%zu]\n",
+                kernel_name, enqueue_err,
+                global_work_size[0], work_dim > 1 ? global_work_size[1] : 1, work_dim > 2 ? global_work_size[2] : 1,
+                local_work_size ? local_work_size[0] : 0,
+                local_work_size && work_dim > 1 ? local_work_size[1] : 0,
+                local_work_size && work_dim > 2 ? local_work_size[2] : 0);
+        }
+        CL_CHECK(enqueue_err);
+        // Freedreno/Rusticl 26.2 can otherwise report a delayed device fault at
+        // the final graph barrier even though every enqueue succeeded. Serialize
+        // this explicitly experimental path until its cross-kernel ordering is
+        // reliable; normal OpenCL backends remain fully asynchronous.
+        if (getenv("GGML_OPENCL_RUSTICL_SUBGROUP32_COMPAT") != nullptr) {
+            CL_CHECK(clFinish(queue));
+        }
 #endif
     }
 
@@ -1152,6 +1172,14 @@ static cl_program build_program_from_source_ex(cl_context ctx, cl_device_id dev,
     size_t log_size;
     int err;
 
+    std::string compat_program;
+    if (getenv("GGML_OPENCL_RUSTICL_SUBGROUP32_COMPAT") != nullptr) {
+        compat_program = "#define GGML_OPENCL_RUSTICL_SUBGROUP32_COMPAT 1\n"
+                         "#define cl_intel_subgroups 1\n"
+                         "#define cl_intel_required_subgroup_size 1\n";
+        compat_program += program_buffer;
+        program_buffer = compat_program.c_str();
+    }
     program_size = strlen(program_buffer);
 
     const int max_attempts = retry_queue ? 3 : 1;
@@ -1568,6 +1596,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_get_rows_f32  = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_get_rows_f16  = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_f16", &err), err));
         CL_CHECK((backend_ctx->kernel_get_rows_q4_0 = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_q4_0", &err), err));
+        CL_CHECK((backend_ctx->kernel_get_rows_q8_0_soa = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_q8_0_soa", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -5718,8 +5747,16 @@ static bool ggml_opencl_is_device_supported(ggml_backend_dev_t dev) {
     GGML_ASSERT(dev_ctx->platform);
     GGML_ASSERT(dev_ctx->device);
 
+    // Mesa/Rusticl names Freedreno devices "FDxxx" (for example FD702) rather than
+    // including "Adreno" or "Qualcomm" in CL_DEVICE_NAME. Use the authoritative
+    // CL_DEVICE_VENDOR too so those devices are not discarded before capability checks.
+    char device_vendor[128] = {};
+    CL_CHECK(clGetDeviceInfo(dev_ctx->device, CL_DEVICE_VENDOR,
+                             sizeof(device_vendor), device_vendor, nullptr));
+
     if (strstr(dev_ctx->device_name.c_str(), "Adreno") ||
         strstr(dev_ctx->device_name.c_str(), "Qualcomm") ||
+        strstr(device_vendor, "Qualcomm") ||
         strstr(dev_ctx->device_version.c_str(), "Adreno")) {
         dev_ctx->gpu_family = GPU_FAMILY::ADRENO;
 
@@ -5769,9 +5806,11 @@ static bool ggml_opencl_is_device_supported(ggml_backend_dev_t dev) {
 
     // If OpenCL 3.0 is supported, then check for cl_khr_subgroups, which becomes
     // optional in OpenCL 3.0 (cl_khr_subgroup is mandatory in OpenCL 2.x)
-    if (opencl_c_version.major == 3 && strstr(ext_buffer, "cl_khr_subgroups") == NULL &&
+    if (opencl_c_version.major >= 3 && strstr(ext_buffer, "cl_khr_subgroups") == NULL &&
+        strstr(ext_buffer, "cl_khr_subgroup_non_uniform_arithmetic") == NULL &&
         strstr(ext_buffer, "cl_intel_subgroups") == NULL) {
-        GGML_LOG_WARN("ggml_opencl: device does not support subgroups (cl_khr_subgroups or cl_intel_subgroups) "
+        GGML_LOG_WARN("ggml_opencl: device does not support subgroup arithmetic "
+            "(cl_khr_subgroups, cl_khr_subgroup_non_uniform_arithmetic, or cl_intel_subgroups) "
             "(note that subgroups is an optional feature in OpenCL 3.0)\n");
         return false;
     }
@@ -5812,6 +5851,14 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
 
     backend_ctx->gpu_family = dev_ctx->gpu_family;
     backend_ctx->adreno_gen = dev_ctx->adreno_gen;
+    // Rusticl exposes the cl_intel_* compatibility attributes needed by ggml's
+    // portable path. Reuse its at-most-32-thread dispatch geometry while retaining
+    // Adreno classification during the device capability check above. Kernels that
+    // need a whole work-group reduction must not assume the physical subgroup is 32.
+    if (getenv("GGML_OPENCL_RUSTICL_SUBGROUP32_COMPAT") != nullptr &&
+        backend_ctx->gpu_family == GPU_FAMILY::ADRENO) {
+        backend_ctx->gpu_family = GPU_FAMILY::INTEL;
+    }
     if (backend_ctx->gpu_family == GPU_FAMILY::ADRENO) {
         ggml_cl_init_fa_dims_table();
 
@@ -5995,7 +6042,8 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     backend_ctx->prealloc_act_trans.allocate(context, max_B_d_bytes);
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
-    backend_ctx->disable_fusion = getenv("GGML_OPENCL_DISABLE_FUSION") != nullptr;
+    backend_ctx->disable_fusion = getenv("GGML_OPENCL_DISABLE_FUSION") != nullptr ||
+        getenv("GGML_OPENCL_RUSTICL_SUBGROUP32_COMPAT") != nullptr;
 
     dev_ctx->backend_ctx = backend_ctx.release();
     return dev_ctx->backend_ctx;
@@ -7081,6 +7129,12 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
 #else // GGML_OPENCL_SOA_Q
                     return true;
 #endif // GGML_OPENCL_SOA_Q
+                case GGML_TYPE_Q8_0:
+#ifdef GGML_OPENCL_SOA_Q
+                    return true;
+#else
+                    return false;
+#endif
                 default:
                     return false;
             }
@@ -7989,9 +8043,11 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
 
         size_t global_work_size[] = {(size_t)ggml_nelements(tensor)/ggml_blck_size(tensor->type), 1, 1};
         size_t local_work_size[] = {64, 1, 1};
+        const size_t * requested_local_work_size =
+            getenv("GGML_OPENCL_RUSTICL_SUBGROUP32_COMPAT") != nullptr ? nullptr : local_work_size;
 
         cl_event evt;
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, requested_local_work_size, 0, NULL, &evt));
         CL_CHECK(clWaitForEvents(1, &evt));
         CL_CHECK(clReleaseMemObject(data_device));
 
@@ -8137,9 +8193,11 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
 
         size_t global_work_size[] = {(size_t)ggml_nelements(tensor)/ggml_blck_size(tensor->type), 1, 1};
         size_t local_work_size[] = {64, 1, 1};
+        const size_t * requested_local_work_size =
+            getenv("GGML_OPENCL_RUSTICL_SUBGROUP32_COMPAT") != nullptr ? nullptr : local_work_size;
 
         cl_event evt;
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, requested_local_work_size, 0, NULL, &evt));
         CL_CHECK(clWaitForEvents(1, &evt));
         CL_CHECK(clReleaseMemObject(data_device));
 
@@ -8774,9 +8832,11 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
 
         size_t global_work_size[] = {(size_t)ggml_nelements(tensor)/ggml_blck_size(tensor->type), 1, 1};
         size_t local_work_size[] = {64, 1, 1};
+        const size_t * requested_local_work_size =
+            getenv("GGML_OPENCL_RUSTICL_SUBGROUP32_COMPAT") != nullptr ? nullptr : local_work_size;
 
         cl_event evt;
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, requested_local_work_size, 0, NULL, &evt));
         CL_CHECK(clWaitForEvents(1, &evt));
         CL_CHECK(clReleaseMemObject(data_device));
 
@@ -9035,9 +9095,11 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
 
         size_t global_work_size[] = {(size_t)ggml_nelements(tensor)/ggml_blck_size(tensor->type), 1, 1};
         size_t local_work_size[] = {64, 1, 1};
+        const size_t * requested_local_work_size =
+            getenv("GGML_OPENCL_RUSTICL_SUBGROUP32_COMPAT") != nullptr ? nullptr : local_work_size;
 
         cl_event evt;
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, requested_local_work_size, 0, NULL, &evt));
         CL_CHECK(clWaitForEvents(1, &evt));
         CL_CHECK(clReleaseMemObject(data_device));
 
@@ -11129,11 +11191,9 @@ static void ggml_cl_get_rows(ggml_backend_t backend, const ggml_tensor * src0, c
 
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
-    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
     ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
     ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
 
-    cl_ulong offset0 = extra0->offset + src0->view_offs;
     cl_ulong offset1 = extra1->offset + src1->view_offs;
     cl_ulong offsetd = extrad->offset + dst->view_offs;
 
@@ -11149,27 +11209,53 @@ static void ggml_cl_get_rows(ggml_backend_t backend, const ggml_tensor * src0, c
         case GGML_TYPE_Q4_0:
             kernel = backend_ctx->kernel_get_rows_q4_0;
             break;
+        case GGML_TYPE_Q8_0:
+            kernel = backend_ctx->kernel_get_rows_q8_0_soa;
+            break;
         default:
             GGML_ASSERT(false && "not implemented");
     }
 
-    CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
-    CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
-    CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra1->data_device));
-    CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offset1));
-    CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &extrad->data_device));
-    CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &offsetd));
-    CL_CHECK(clSetKernelArg(kernel,  6, sizeof(int),      &ne00));
-    CL_CHECK(clSetKernelArg(kernel,  7, sizeof(cl_ulong), &nb01));
-    CL_CHECK(clSetKernelArg(kernel,  8, sizeof(cl_ulong), &nb02));
-    CL_CHECK(clSetKernelArg(kernel,  9, sizeof(cl_ulong), &nb03));
-    CL_CHECK(clSetKernelArg(kernel, 10, sizeof(int),      &ne10));
-    CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_ulong), &nb10));
-    CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_ulong), &nb11));
-    CL_CHECK(clSetKernelArg(kernel, 13, sizeof(cl_ulong), &nb12));
-    CL_CHECK(clSetKernelArg(kernel, 14, sizeof(cl_ulong), &nb1));
-    CL_CHECK(clSetKernelArg(kernel, 15, sizeof(cl_ulong), &nb2));
-    CL_CHECK(clSetKernelArg(kernel, 16, sizeof(cl_ulong), &nb3));
+    if (src0->type == GGML_TYPE_Q8_0) {
+        GGML_ASSERT(src0->view_offs == 0);
+        auto * extra0 = (ggml_tensor_extra_cl_q8_0 *)src0->extra;
+        CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->q));
+        CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),   &extra0->d));
+        CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra1->data_device));
+        CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offset1));
+        CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &extrad->data_device));
+        CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &offsetd));
+        CL_CHECK(clSetKernelArg(kernel,  6, sizeof(int),      &ne00));
+        CL_CHECK(clSetKernelArg(kernel,  7, sizeof(int),      &ne01));
+        CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &ne02));
+        CL_CHECK(clSetKernelArg(kernel,  9, sizeof(int),      &ne10));
+        CL_CHECK(clSetKernelArg(kernel, 10, sizeof(cl_ulong), &nb10));
+        CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_ulong), &nb11));
+        CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_ulong), &nb12));
+        CL_CHECK(clSetKernelArg(kernel, 13, sizeof(cl_ulong), &nb1));
+        CL_CHECK(clSetKernelArg(kernel, 14, sizeof(cl_ulong), &nb2));
+        CL_CHECK(clSetKernelArg(kernel, 15, sizeof(cl_ulong), &nb3));
+    } else {
+        auto * extra0 = (ggml_tensor_extra_cl *)src0->extra;
+        cl_ulong offset0 = extra0->offset + src0->view_offs;
+        CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
+        CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
+        CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra1->data_device));
+        CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offset1));
+        CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &extrad->data_device));
+        CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &offsetd));
+        CL_CHECK(clSetKernelArg(kernel,  6, sizeof(int),      &ne00));
+        CL_CHECK(clSetKernelArg(kernel,  7, sizeof(cl_ulong), &nb01));
+        CL_CHECK(clSetKernelArg(kernel,  8, sizeof(cl_ulong), &nb02));
+        CL_CHECK(clSetKernelArg(kernel,  9, sizeof(cl_ulong), &nb03));
+        CL_CHECK(clSetKernelArg(kernel, 10, sizeof(int),      &ne10));
+        CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_ulong), &nb10));
+        CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_ulong), &nb11));
+        CL_CHECK(clSetKernelArg(kernel, 13, sizeof(cl_ulong), &nb12));
+        CL_CHECK(clSetKernelArg(kernel, 14, sizeof(cl_ulong), &nb1));
+        CL_CHECK(clSetKernelArg(kernel, 15, sizeof(cl_ulong), &nb2));
+        CL_CHECK(clSetKernelArg(kernel, 16, sizeof(cl_ulong), &nb3));
+    }
 
     int max_workgroup_size = backend_ctx->get_kernel_workgroup_size(kernel);
     int nth = 1;
@@ -18845,7 +18931,11 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
     // GEMM using local memory
     // Current BK = 16, so ne00 % 16 == 0
-    if (src1t == GGML_TYPE_F32 &&
+    // Freedreno/Rusticl on the FD702 limits these kernels to fewer than the
+    // fixed 128 work-items required by their 64x64 tile. The generic subgroup
+    // kernels below use smaller work-groups and cover the same operations.
+    if (getenv("GGML_OPENCL_RUSTICL_SUBGROUP32_COMPAT") == nullptr &&
+        src1t == GGML_TYPE_F32 &&
         ne00 % 16 == 0 &&
         ne11 > 1) {
         switch(src0t) {

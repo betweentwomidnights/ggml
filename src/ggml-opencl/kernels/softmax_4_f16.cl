@@ -57,8 +57,8 @@ kernel void kernel_soft_max_4_f16(
     int i02 = get_group_id(1);
     int i01 = get_group_id(0);
 
-    int i13 = i03%ne13;
-    int i12 = i02%ne12;
+    int i13 = ne13 ? i03%ne13 : 0;
+    int i12 = ne12 ? i02%ne12 : 0;
     int i11 = i01;
 
     global float4 * psrc4 = (global float4 *)(src0 + i01*nb01 + i02*nb02 + i03*nb03);
@@ -85,7 +85,21 @@ kernel void kernel_soft_max_4_f16(
     }
     float lmax = fmax(fmax(lmax4.s0, lmax4.s1), fmax(lmax4.s2, lmax4.s3));
 
+#ifdef GGML_OPENCL_RUSTICL_SUBGROUP32_COMPAT
+    local float scratch[32];
+    const int lid = get_local_id(0);
+    scratch[lid] = lmax;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (lid == 0) {
+        float reduced = scratch[0];
+        for (int i = 1; i < get_local_size(0); ++i) reduced = fmax(reduced, scratch[i]);
+        scratch[0] = reduced;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    const float max = scratch[0];
+#else
     const float max = sub_group_reduce_max(lmax);
+#endif
 
     // parallel sum
     float4 lsum4 = 0.0f;
@@ -96,7 +110,19 @@ kernel void kernel_soft_max_4_f16(
     }
     float lsum = lsum4.s0 + lsum4.s1 + lsum4.s2 + lsum4.s3;
 
+#ifdef GGML_OPENCL_RUSTICL_SUBGROUP32_COMPAT
+    scratch[lid] = lsum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (lid == 0) {
+        float reduced = scratch[0];
+        for (int i = 1; i < get_local_size(0); ++i) reduced += scratch[i];
+        scratch[0] = reduced;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    float sum = scratch[0];
+#else
     float sum = sub_group_reduce_add(lsum);
+#endif
 
     if (psrc2) {
         sum += exp(psrc2[i02] - max);
