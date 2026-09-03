@@ -378,13 +378,16 @@ struct ProfilingInfo {
     size_t local_size[3];
     // Op output size.
     size_t output_size[4];
+    uint64_t dispatch_id = 0;
+    int64_t host_enqueue_us = 0;
+    int64_t host_finish_us = 0;
 };
 
 static void populateProfilingInfo(
         ProfilingInfo& info, cl_event evt, cl_kernel kernel, cl_uint work_dim,
         size_t global_size[3], size_t local_size[3],
         const ggml_tensor * tensor) {
-    info.op_name     = tensor->name;
+    info.op_name     = tensor ? tensor->name : "upload";
     info.kernel      = kernel;
     info.evt         = evt;
 
@@ -407,10 +410,9 @@ static void populateProfilingInfo(
         info.global_size[i] = global_size[i];
     }
 
-    info.output_size[0] = tensor->ne[0];
-    info.output_size[1] = tensor->ne[1];
-    info.output_size[2] = tensor->ne[2];
-    info.output_size[3] = tensor->ne[3];
+    for (int i = 0; i < 4; ++i) {
+        info.output_size[i] = tensor ? tensor->ne[i] : 0;
+    }
 }
 
 struct ggml_backend_opencl_context;
@@ -906,6 +908,34 @@ struct ggml_backend_opencl_context {
 
     std::vector<ProfilingInfo> profiling_info;
     std::vector<ProfilingInfo> profiling_results;
+    uint64_t dispatch_id = 0;
+    bool dispatch_diagnostics_initialized = false;
+    bool rusticl_compat = false;
+    uint64_t rusticl_finish_interval = 1;
+    FILE * dispatch_trace = nullptr;
+
+    void init_dispatch_diagnostics() {
+        if (dispatch_diagnostics_initialized) {
+            return;
+        }
+        dispatch_diagnostics_initialized = true;
+        rusticl_compat = getenv("GGML_OPENCL_RUSTICL_SUBGROUP32_COMPAT") != nullptr;
+        if (rusticl_compat) {
+            if (const char * value = getenv("GGML_OPENCL_RUSTICL_FINISH_INTERVAL")) {
+                uint64_t parsed = 0;
+                const auto result = std::from_chars(value, value + strlen(value), parsed);
+                GGML_ASSERT(result.ec == std::errc() && result.ptr == value + strlen(value));
+                rusticl_finish_interval = parsed;
+                GGML_LOG_WARN("ggml_opencl: EXPERIMENTAL finish interval=%" PRIu64 " (0=async; may fault)\n", parsed);
+            }
+        }
+        if (const char * path = getenv("GGML_OPENCL_DISPATCH_TRACE")) {
+            dispatch_trace = fopen(path, "w");
+            GGML_ASSERT(dispatch_trace && "cannot open dispatch trace");
+            fprintf(dispatch_trace, "id\tstate\tkernel\top\tglobal\tlocal\tenqueue_us\tfinish_us\tstatus\n");
+            fflush(dispatch_trace);
+        }
+    }
 
     void flush_profiling_batch() {
         if (profiling_info.empty()) {
@@ -968,14 +998,16 @@ struct ggml_backend_opencl_context {
             return;
         }
 
-        fprintf(fperf, "op name, kernel name, exec duration (ms), global size, local size, output size\n");
+        fprintf(fperf, "op name,kernel name,exec duration (ms),global size,local size,output size,dispatch id,host enqueue (ms),host finish (ms),queued to submit (ms),submit to start (ms)\n");
         for (const ProfilingInfo & info : profiling_results) {
-            fprintf(fperf, "%s,%s,%f,%zux%zux%zu,%zux%zux%zu,%zux%zux%zux%zu\n",
+            fprintf(fperf, "%s,%s,%f,%zux%zux%zu,%zux%zux%zu,%zux%zux%zux%zu,%" PRIu64 ",%.6f,%.6f,%.6f,%.6f\n",
                 info.op_name.c_str(), info.kernel_name.c_str(),
                 info.cmd_duration_ns/1.e6f,
                 info.global_size[0], info.global_size[1], info.global_size[2],
                 info.local_size[0], info.local_size[1], info.local_size[2],
-                info.output_size[0], info.output_size[1], info.output_size[2], info.output_size[3]);
+                info.output_size[0], info.output_size[1], info.output_size[2], info.output_size[3],
+                info.dispatch_id, info.host_enqueue_us/1.e3, info.host_finish_us/1.e3,
+                info.cmd_queued_duration_ns/1.e6, info.cmd_submit_duration_ns/1.e6);
         }
         fclose(fperf);
 
@@ -987,7 +1019,10 @@ struct ggml_backend_opencl_context {
         }
 
         fprintf(ftrace, "[\n");
+        bool first_trace_event = true;
         for (const ProfilingInfo & info : profiling_results) {
+            if (!first_trace_event) fprintf(ftrace, ",\n");
+            first_trace_event = false;
             fprintf(ftrace, "{\"name\": \"%s\", \"cat\": \"OpenCL\", \"ph\": \"B\", \"ts\": %" PRIu64 ", \"pid\": \"\", \"tid\": \"Host\"},\n",
                 info.kernel_name.c_str(), info.cmd_queued/1000);
             fprintf(ftrace, "{\"name\": \"%s\", \"cat\": \"OpenCL\", \"ph\": \"E\", \"ts\": %" PRIu64 ", \"pid\": \"\", \"tid\": \"Host\"},\n",
@@ -995,7 +1030,7 @@ struct ggml_backend_opencl_context {
 
             fprintf(ftrace, "{\"name\": \"%s\", \"cat\": \"OpenCL\", \"ph\": \"B\", \"ts\": %" PRIu64 ", \"pid\": \"\", \"tid\": \"Device\"},\n",
                 info.kernel_name.c_str(), info.cmd_start/1000);
-            fprintf(ftrace, "{\"name\": \"%s\", \"cat\": \"OpenCL\", \"ph\": \"E\", \"ts\": %" PRIu64 ", \"pid\": \"\", \"tid\": \"Device\"},\n",
+            fprintf(ftrace, "{\"name\": \"%s\", \"cat\": \"OpenCL\", \"ph\": \"E\", \"ts\": %" PRIu64 ", \"pid\": \"\", \"tid\": \"Device\"}\n",
                 info.kernel_name.c_str(), info.cmd_end/1000);
         }
         fprintf(ftrace, "]\n");
@@ -1013,21 +1048,37 @@ struct ggml_backend_opencl_context {
     }
 
     void enqueue_ndrange_kernel(cl_kernel kernel, cl_uint work_dim, size_t *global_work_size, size_t *local_work_size, const ggml_tensor * tensor) {
+        init_dispatch_diagnostics();
+        const uint64_t id = ++dispatch_id;
+        char kernel_name[256] = {};
+        auto trace = [&](const char * state, int64_t enqueue_us, int64_t finish_us, cl_int status) {
+            if (!dispatch_trace) return;
+            if (!kernel_name[0]) {
+                CL_CHECK(clGetKernelInfo(kernel, CL_KERNEL_FUNCTION_NAME, sizeof(kernel_name), kernel_name, nullptr));
+            }
+            fprintf(dispatch_trace, "%" PRIu64 "\t%s\t%s\t%s\t%zux%zux%zu\t%zux%zux%zu\t%" PRId64 "\t%" PRId64 "\t%d\n",
+                id, state, kernel_name, tensor ? ggml_op_name(tensor->op) : "upload",
+                global_work_size[0], work_dim > 1 ? global_work_size[1] : 1, work_dim > 2 ? global_work_size[2] : 1,
+                local_work_size ? local_work_size[0] : 0,
+                local_work_size && work_dim > 1 ? local_work_size[1] : 0,
+                local_work_size && work_dim > 2 ? local_work_size[2] : 0, enqueue_us, finish_us, status);
+            fflush(dispatch_trace); // Preserve the last submitted boundary even if the driver aborts.
+        };
+        cl_event evt = nullptr;
+        cl_event * event_out = nullptr;
 #ifdef GGML_OPENCL_PROFILING
-        cl_event evt;
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, &evt));
-
-        profiling_info.emplace_back();
-        populateProfilingInfo(profiling_info.back(), evt, kernel, work_dim, global_work_size, local_work_size, tensor);
-        if (profiling_info.size() >= 2048) {
-            flush_profiling_batch();
-        }
+        event_out = &evt;
 #else
-        GGML_UNUSED(tensor);
+        GGML_UNUSED(evt);
+#endif
+        trace("before", 0, 0, CL_SUCCESS);
+        const bool measure = event_out || dispatch_trace;
+        const int64_t enqueue_start = measure ? ggml_time_us() : 0;
         const cl_int enqueue_err = clEnqueueNDRangeKernel(
-            queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, NULL);
+            queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, event_out);
+        const int64_t enqueue_us = measure ? ggml_time_us() - enqueue_start : 0;
+        trace("enqueued", enqueue_us, 0, enqueue_err);
         if (enqueue_err != CL_SUCCESS) {
-            char kernel_name[256] = {};
             clGetKernelInfo(kernel, CL_KERNEL_FUNCTION_NAME, sizeof(kernel_name), kernel_name, nullptr);
             GGML_LOG_ERROR("ggml_opencl: enqueue %s failed (%d), global=[%zu,%zu,%zu], local=[%zu,%zu,%zu]\n",
                 kernel_name, enqueue_err,
@@ -1037,12 +1088,28 @@ struct ggml_backend_opencl_context {
                 local_work_size && work_dim > 2 ? local_work_size[2] : 0);
         }
         CL_CHECK(enqueue_err);
-        // Freedreno/Rusticl 26.2 can otherwise report a delayed device fault at
-        // the final graph barrier even though every enqueue succeeded. Serialize
-        // this explicitly experimental path until its cross-kernel ordering is
-        // reliable; normal OpenCL backends remain fully asynchronous.
-        if (getenv("GGML_OPENCL_RUSTICL_SUBGROUP32_COMPAT") != nullptr) {
-            CL_CHECK(clFinish(queue));
+        // Keep the SAME conservative synchronization in profiling and normal builds.
+        // The root cause masked by clFinish is not yet known. Async/batched dispatch
+        // is explicitly opt-in for fault reduction, never the compatibility default.
+        const bool finish = rusticl_compat && rusticl_finish_interval && id % rusticl_finish_interval == 0;
+        int64_t finish_us = 0;
+        if (finish) {
+            const int64_t finish_start = ggml_time_us();
+            const cl_int finish_err = clFinish(queue);
+            finish_us = ggml_time_us() - finish_start;
+            trace("finished", enqueue_us, finish_us, finish_err);
+            CL_CHECK(finish_err);
+        }
+#ifdef GGML_OPENCL_PROFILING
+        profiling_info.emplace_back();
+        populateProfilingInfo(profiling_info.back(), evt, kernel, work_dim, global_work_size, local_work_size, tensor);
+        profiling_info.back().dispatch_id = id;
+        profiling_info.back().host_enqueue_us = enqueue_us;
+        profiling_info.back().host_finish_us = finish_us;
+        // Finished events can be released immediately. Async profiling retains the
+        // existing bounded batch, whose wait is an additional diagnostic barrier.
+        if (finish || profiling_info.size() >= 2048) {
+            flush_profiling_batch();
         }
 #endif
     }
@@ -1116,6 +1183,13 @@ struct ggml_backend_opencl_context {
 
         ref_count--;
         if (ref_count == 0) {
+            if (dispatch_trace) {
+                fclose(dispatch_trace);
+                dispatch_trace = nullptr;
+            }
+            dispatch_diagnostics_initialized = false;
+            dispatch_id = 0;
+            rusticl_finish_interval = 1;
 #ifdef GGML_OPENCL_PROFILING
             flush_profiling_batch();
             write_profiling_info();
@@ -18931,10 +19005,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
     // GEMM using local memory
     // Current BK = 16, so ne00 % 16 == 0
-    // Freedreno/Rusticl on the FD702 limits these kernels to fewer than the
-    // fixed 128 work-items required by their 64x64 tile. The generic subgroup
-    // kernels below use smaller work-groups and cover the same operations.
-    if (getenv("GGML_OPENCL_RUSTICL_SUBGROUP32_COMPAT") == nullptr &&
+    // Opt-in Rusticl K-quant GEMM uses a 32x32 tile / 32 work-items. Other
+    // 64x64 / 128-work-item kernels still exceed FD702's per-kernel limits.
+    const bool rusticl_small_tile = getenv("GGML_OPENCL_RUSTICL_SUBGROUP32_COMPAT") != nullptr;
+    const bool rusticl_tiled_k = rusticl_small_tile && getenv("GGML_OPENCL_RUSTICL_TILED_K") != nullptr &&
+        (src0t == GGML_TYPE_Q4_K || src0t == GGML_TYPE_Q6_K);
+    if ((!rusticl_small_tile || rusticl_tiled_k) &&
         src1t == GGML_TYPE_F32 &&
         ne00 % 16 == 0 &&
         ne11 > 1) {
@@ -19386,7 +19462,9 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 }
 
                 kernel = backend_ctx->kernel_mul_mm_q4_k_f32_l4_lm;
-                nth0 = 128; // calculated as (BM*BN)/(TM*TN)
+                const int tile = rusticl_small_tile ? 32 : 64;
+                nth0 = tile*tile/(4*8); // must match BM, BN, TM, TN in the kernel
+                if (rusticl_small_tile && backend_ctx->get_kernel_workgroup_size(kernel) < (size_t)nth0) break;
 
                 int batch_stride_a = ne00*ne01;
                 int batch_stride_b = ne10*ne11;
@@ -19414,8 +19492,8 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 CL_CHECK(clSetKernelArg(kernel, 19, sizeof(int),      &r2));
                 CL_CHECK(clSetKernelArg(kernel, 20, sizeof(int),      &r3));
 
-                // 64 is block tile size BM and BN - change here when BM and BN in the kernel are changed.
-                size_t global_work_size[] = {(size_t)(CEIL_DIV(ne01, 64)*nth0), (size_t)(CEIL_DIV(ne11, 64)), (size_t)ne12*ne13};
+                // Tile sizes must match the compile-time Rusticl kernel variant.
+                size_t global_work_size[] = {(size_t)(CEIL_DIV(ne01, tile)*nth0), (size_t)(CEIL_DIV(ne11, tile)), (size_t)ne12*ne13};
                 size_t local_work_size[] = {(size_t)nth0, 1, 1};
 
                 backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
@@ -19475,7 +19553,9 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 }
 
                 kernel = backend_ctx->kernel_mul_mm_q6_k_f32_l4_lm;
-                nth0 = 128; // calculated as (BM*BN)/(TM*TN)
+                const int tile = rusticl_small_tile ? 32 : 64;
+                nth0 = tile*tile/(4*8);
+                if (rusticl_small_tile && backend_ctx->get_kernel_workgroup_size(kernel) < (size_t)nth0) break;
 
                 int batch_stride_a = ne00*ne01;
                 int batch_stride_b = ne10*ne11;
@@ -19503,8 +19583,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 CL_CHECK(clSetKernelArg(kernel, 19, sizeof(int),      &r2));
                 CL_CHECK(clSetKernelArg(kernel, 20, sizeof(int),      &r3));
 
-                // 64 is block tile size BM and BN - change here when BM and BN in the kernel are changed.
-                size_t global_work_size[] = {(size_t)(CEIL_DIV(ne01, 64)*nth0), (size_t)(CEIL_DIV(ne11, 64)), (size_t)ne12*ne13};
+                size_t global_work_size[] = {(size_t)(CEIL_DIV(ne01, tile)*nth0), (size_t)(CEIL_DIV(ne11, tile)), (size_t)ne12*ne13};
                 size_t local_work_size[] = {(size_t)nth0, 1, 1};
 
                 backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);

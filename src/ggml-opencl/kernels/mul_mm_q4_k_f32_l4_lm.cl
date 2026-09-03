@@ -3,8 +3,13 @@
 #define LOAD_VEC_A 4
 #define LOAD_VEC_B 4
 
+#ifdef GGML_OPENCL_RUSTICL_SUBGROUP32_COMPAT
+#define BM 32
+#define BN 32
+#else
 #define BM 64
 #define BN 64
+#endif
 #define BK 32
 #define TM 4
 #define TN 8
