@@ -1,5 +1,51 @@
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 
+#ifdef GGML_OPENCL_RUSTICL_SUBGROUP32_COMPAT
+// 32 work-items, 32x32 output tile, 8.25 KiB shared storage. Both weight
+// precisions use FP32 accumulation. Byte strides also support attention views.
+#define SMALL_FLOAT_GEMM(NAME, TYPE) \
+__kernel void NAME(int M, int N, int K, \
+    __global const char * A, ulong ao, __global const char * B, ulong bo, \
+    __global char * C, ulong co, ulong ak, ulong am, ulong bk, ulong bn) { \
+    __local float la[32][33]; \
+    __local float lb[32][33]; \
+    const int tid = get_local_id(0); \
+    const int rm = tid % 8, rn = tid / 8; \
+    const int base_m = get_group_id(0) * 32; \
+    const int base_n = get_group_id(1) * 32; \
+    float acc[4][8] = {{0}}; \
+    for (int base_k = 0; base_k < K; base_k += 32) { \
+        for (int i = tid; i < 1024; i += 32) { \
+            const int row = i / 32, k = base_k + i % 32; \
+            la[row][i % 32] = base_m + row < M && k < K ? \
+                (float)*(__global const TYPE *)(A + ao + (base_m + row)*am + k*ak) : 0.0f; \
+            lb[row][i % 32] = base_n + row < N && k < K ? \
+                *(__global const float *)(B + bo + (base_n + row)*bn + k*bk) : 0.0f; \
+        } \
+        barrier(CLK_LOCAL_MEM_FENCE); \
+        for (int k = 0; k < 32; ++k) { \
+            for (int m = 0; m < 4; ++m) { \
+                const float a = la[rm + m*8][k]; \
+                for (int n = 0; n < 8; ++n) { \
+                    acc[m][n] = mad(a, lb[rn + n*4][k], acc[m][n]); \
+                } \
+            } \
+        } \
+        barrier(CLK_LOCAL_MEM_FENCE); \
+    } \
+    __global float * out = (__global float *)(C + co); \
+    for (int m = 0; m < 4; ++m) { \
+        for (int n = 0; n < 8; ++n) { \
+            const int row = base_m + rm + m*8, col = base_n + rn + n*4; \
+            if (row < M && col < N) out[col*M + row] = acc[m][n]; \
+        } \
+    } \
+}
+SMALL_FLOAT_GEMM(mul_mat_f16_f32_small, half)
+SMALL_FLOAT_GEMM(mul_mat_f32_f32_small, float)
+#undef SMALL_FLOAT_GEMM
+#endif
+
 #if defined(cl_qcom_reqd_sub_group_size)
 #pragma OPENCL EXTENSION cl_qcom_reqd_sub_group_size : enable
 #define REQD_SUBGROUP_SIZE_128 __attribute__((qcom_reqd_sub_group_size("full")))

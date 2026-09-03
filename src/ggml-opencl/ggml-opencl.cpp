@@ -768,6 +768,9 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mat_f16_f32_l4_y8_gqa = nullptr;
     cl_kernel kernel_mul_mat_f16_f32_l4_y8_gqa_img = nullptr;
     cl_kernel kernel_mul_mat_f16_f32_tiled;
+    bool kernel_mul_mat_f16_f32_tiled_valid = false;
+    cl_kernel kernel_mul_mat_f16_f32_small = nullptr;
+    cl_kernel kernel_mul_mat_f32_f32_small = nullptr;
     cl_kernel kernel_adreno_xmem_pack_src_f32;
     cl_kernel kernel_adreno_xmem_prepack_weight_f16;
     cl_kernel kernel_gemm_xmem_f16_f32_os8;
@@ -2289,6 +2292,24 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mat_f16_f32_tiled = clCreateKernel(backend_ctx->program_mul_mat_f16_f32_tiled, "mul_mat_f16_f32", &err), err));
+        size_t max_wg = 0;
+        CL_CHECK(clGetKernelWorkGroupInfo(backend_ctx->kernel_mul_mat_f16_f32_tiled,
+            backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(max_wg), &max_wg, nullptr));
+        backend_ctx->kernel_mul_mat_f16_f32_tiled_valid = max_wg >= 128;
+        if (getenv("GGML_OPENCL_RUSTICL_SUBGROUP32_COMPAT") != nullptr) {
+            for (auto entry : {std::make_pair("mul_mat_f16_f32_small", &backend_ctx->kernel_mul_mat_f16_f32_small),
+                               std::make_pair("mul_mat_f32_f32_small", &backend_ctx->kernel_mul_mat_f32_f32_small)}) {
+                cl_kernel small = clCreateKernel(backend_ctx->program_mul_mat_f16_f32_tiled, entry.first, &err);
+                CL_CHECK(err);
+                CL_CHECK(clGetKernelWorkGroupInfo(small, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE,
+                    sizeof(max_wg), &max_wg, nullptr));
+                if (max_wg >= 32) {
+                    *entry.second = small;
+                } else {
+                    CL_CHECK(clReleaseKernel(small));
+                }
+            }
+        }
         GGML_LOG_CONT(".");
     }
 
@@ -15445,6 +15466,90 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     }
 }
 
+// Bound individual submissions on embedded GPUs with a fence-progress watchdog.
+// This is a dispatch heuristic, not a time guarantee. 32-column boundaries keep
+// the tiled kernels' accumulation order unchanged, including the final partial tile.
+static int ggml_cl_rusticl_gemm_columns(const ggml_tensor * a, const ggml_tensor * b, int64_t batches) {
+    const int N = b->ne[1];
+    const char * value = getenv("GGML_OPENCL_RUSTICL_GEMM_MAX_COLUMNS");
+    if (!value || getenv("GGML_OPENCL_RUSTICL_SUBGROUP32_COMPAT") == nullptr) return N;
+    int requested = 0;
+    const auto parsed = std::from_chars(value, value + strlen(value), requested);
+    GGML_ASSERT(parsed.ec == std::errc() && parsed.ptr == value + strlen(value) && requested >= 32 && requested % 32 == 0);
+    const double work_per_column = 2.0 * a->ne[0] * a->ne[1] * batches;
+    const int budget_columns = std::max(32, (int(std::min<double>(N, 500000000.0 / work_per_column)) / 32) * 32);
+    return std::min({N, requested, budget_columns});
+}
+
+// Q4_K and Q6_K tiled GEMMs share these argument indices. Preserve full batch
+// strides while shifting the B/D base pointers and restricting the column bound.
+static void ggml_cl_enqueue_k_tiles(ggml_backend_opencl_context * ctx, cl_kernel kernel,
+                                    const ggml_tensor * a, const ggml_tensor * b, const ggml_tensor * dst,
+                                    cl_ulong offset_b, cl_ulong offset_d, int tile, int threads) {
+    const int columns = ggml_cl_rusticl_gemm_columns(a, b, b->ne[2]*b->ne[3]);
+    for (int start = 0; start < b->ne[1]; start += columns) {
+        const int count = std::min<int64_t>(columns, b->ne[1] - start);
+        const cl_ulong bo = offset_b + start*b->nb[1];
+        const cl_ulong co = offset_d + start*dst->nb[1];
+        CL_CHECK(clSetKernelArg(kernel, 5, sizeof(bo), &bo));
+        CL_CHECK(clSetKernelArg(kernel, 7, sizeof(co), &co));
+        CL_CHECK(clSetKernelArg(kernel, 11, sizeof(count), &count));
+        size_t global[] = {(size_t) CEIL_DIV(a->ne[1], tile)*threads, (size_t) CEIL_DIV(count, tile),
+                           (size_t) b->ne[2]*b->ne[3]};
+        size_t local[] = {(size_t) threads, 1, 1};
+        ctx->enqueue_ndrange_kernel(kernel, 3, global, local, dst);
+    }
+}
+
+static bool ggml_cl_mul_mat_float_small(ggml_backend_t backend, const ggml_tensor * a,
+                                      const ggml_tensor * b, ggml_tensor * dst) {
+    auto * ctx = (ggml_backend_opencl_context *) backend->context;
+    if (getenv("GGML_OPENCL_RUSTICL_SUBGROUP32_COMPAT") == nullptr || getenv("GGML_OPENCL_RUSTICL_TILED_FLOAT") == nullptr ||
+        (a->type != GGML_TYPE_F16 && a->type != GGML_TYPE_F32) || b->type != GGML_TYPE_F32 ||
+        dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) || b->ne[1] <= 1) {
+        return false;
+    }
+    cl_kernel kernel = a->type == GGML_TYPE_F16 ? ctx->kernel_mul_mat_f16_f32_small : ctx->kernel_mul_mat_f32_f32_small;
+    if (kernel == nullptr) return false;
+    auto * ea = (ggml_tensor_extra_cl *) a->extra;
+    auto * eb = (ggml_tensor_extra_cl *) b->extra;
+    auto * ed = (ggml_tensor_extra_cl *) dst->extra;
+    const int M = a->ne[1], N = b->ne[1], K = a->ne[0];
+    const cl_ulong ak = a->nb[0], am = a->nb[1], bk = b->nb[0], bn = b->nb[1];
+    CL_CHECK(clSetKernelArg(kernel, 0, sizeof(M), &M));
+    CL_CHECK(clSetKernelArg(kernel, 1, sizeof(N), &N));
+    CL_CHECK(clSetKernelArg(kernel, 2, sizeof(K), &K));
+    CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem), &ea->data_device));
+    CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_mem), &eb->data_device));
+    CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_mem), &ed->data_device));
+    CL_CHECK(clSetKernelArg(kernel, 9, sizeof(ak), &ak));
+    CL_CHECK(clSetKernelArg(kernel, 10, sizeof(am), &am));
+    CL_CHECK(clSetKernelArg(kernel, 11, sizeof(bk), &bk));
+    CL_CHECK(clSetKernelArg(kernel, 12, sizeof(bn), &bn));
+    size_t local[] = {32, 1};
+    const int columns = ggml_cl_rusticl_gemm_columns(a, b, 1);
+    const int64_t r2 = b->ne[2]/a->ne[2], r3 = b->ne[3]/a->ne[3];
+    for (int64_t i3 = 0; i3 < b->ne[3]; ++i3) {
+        for (int64_t i2 = 0; i2 < b->ne[2]; ++i2) {
+            const cl_ulong ao = ea->offset + a->view_offs + (i2/r2)*a->nb[2] + (i3/r3)*a->nb[3];
+            const cl_ulong bo = eb->offset + b->view_offs + i2*b->nb[2] + i3*b->nb[3];
+            const cl_ulong co = ed->offset + dst->view_offs + i2*dst->nb[2] + i3*dst->nb[3];
+            CL_CHECK(clSetKernelArg(kernel, 4, sizeof(ao), &ao));
+            for (int start = 0; start < N; start += columns) {
+                const int count = std::min(columns, N - start);
+                const cl_ulong bo_tile = bo + start*bn;
+                const cl_ulong co_tile = co + start*dst->nb[1];
+                CL_CHECK(clSetKernelArg(kernel, 1, sizeof(count), &count));
+                CL_CHECK(clSetKernelArg(kernel, 6, sizeof(bo_tile), &bo_tile));
+                CL_CHECK(clSetKernelArg(kernel, 8, sizeof(co_tile), &co_tile));
+                size_t global[] = {(size_t) CEIL_DIV(M, 32)*32, (size_t) CEIL_DIV(count, 32)};
+                ctx->enqueue_ndrange_kernel(kernel, 2, global, local, dst);
+            }
+        }
+    }
+    return true;
+}
+
 static void ggml_cl_mul_mat_f16_f32_tiled(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
@@ -19003,6 +19108,10 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     } // if (ne01 && ne1)
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
+    if (ggml_cl_mul_mat_float_small(backend, src0, src1, dst)) {
+        return;
+    }
+
     // GEMM using local memory
     // Current BK = 16, so ne00 % 16 == 0
     // Opt-in Rusticl K-quant GEMM uses a 32x32 tile / 32 work-items. Other
@@ -19493,10 +19602,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 CL_CHECK(clSetKernelArg(kernel, 20, sizeof(int),      &r3));
 
                 // Tile sizes must match the compile-time Rusticl kernel variant.
-                size_t global_work_size[] = {(size_t)(CEIL_DIV(ne01, tile)*nth0), (size_t)(CEIL_DIV(ne11, tile)), (size_t)ne12*ne13};
-                size_t local_work_size[] = {(size_t)nth0, 1, 1};
-
-                backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+                ggml_cl_enqueue_k_tiles(backend_ctx, kernel, src0, src1, dst, offset1, offsetd, tile, nth0);
                 return;
             }
             case GGML_TYPE_Q5_K: {
@@ -19583,10 +19689,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 CL_CHECK(clSetKernelArg(kernel, 19, sizeof(int),      &r2));
                 CL_CHECK(clSetKernelArg(kernel, 20, sizeof(int),      &r3));
 
-                size_t global_work_size[] = {(size_t)(CEIL_DIV(ne01, tile)*nth0), (size_t)(CEIL_DIV(ne11, tile)), (size_t)ne12*ne13};
-                size_t local_work_size[] = {(size_t)nth0, 1, 1};
-
-                backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+                ggml_cl_enqueue_k_tiles(backend_ctx, kernel, src0, src1, dst, offset1, offsetd, tile, nth0);
                 return;
             }
             default:
@@ -19601,7 +19704,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         src0->ne[2] == 1 && src0->ne[3] == 1 &&
         src1->ne[2] == 1 && src1->ne[3] == 1 &&
         ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
-        backend_ctx->kernel_mul_mat_f16_f32_tiled != NULL) {
+        backend_ctx->kernel_mul_mat_f16_f32_tiled_valid) {
         ggml_cl_mul_mat_f16_f32_tiled(backend, src0, src1, dst);
         return;
     }

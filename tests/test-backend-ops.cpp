@@ -4336,6 +4336,27 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// Nonzero view offset, padded rows, and broadcast batches. Keep the K axis
+// contiguous: this CPU reference backend cannot evaluate transposed RHS inputs.
+struct test_mul_mat_offset : public test_mul_mat {
+    explicit test_mul_mat_offset(ggml_type type)
+        : test_mul_mat(type, GGML_TYPE_F32, 35, 33, 37, {2, 2}, {2, 2}) {}
+
+    std::string vars() override { return test_mul_mat::vars() + ",view_offset=1"; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * a = ggml_new_tensor_4d(ctx, type_a, k, m, bs[0], bs[1]);
+        auto * storage = ggml_new_tensor_4d(ctx, type_b, k + 1, n, bs[0]*nr[0], bs[1]*nr[1]);
+        auto * b = ggml_view_4d(ctx, storage, k, n, bs[0]*nr[0], bs[1]*nr[1],
+            storage->nb[1], storage->nb[2], storage->nb[3], sizeof(float));
+        ggml_set_name(a, "a");
+        ggml_set_name(storage, "b_storage");
+        auto * out = ggml_mul_mat(ctx, a, b);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -8860,12 +8881,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // Embedded OpenCL validation shapes: exercise the multi-row fallback used
     // when a device cannot launch the 128-thread local-memory GEMM tile.
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 768, 256, 768, {1, 1}, {1, 1}));
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 768, 256, 768, {1, 1}, {1, 1}));
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_F16, GGML_TYPE_F32}) {
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 768, 256, 768, {1, 1}, {1, 1}));
+    }
     // Rusticl 32x32 K-quant GEMM: partial output tiles and broadcast batches.
-    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_F16, GGML_TYPE_F32}) {
         test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 35, 33, 256, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 35, 33, 256, {2, 1}, {2, 1}));
+    }
+    // Float tile tails, permuted strides, padded rows and 4D broadcasts.
+    // ggml_mul_mat forbids a transposed left operand (per[0] must stay 0).
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+        test_cases.emplace_back(new test_mul_mat_offset(type));
+        for (auto per : {std::array<int64_t, 4>{0, 1, 2, 3}, {0, 1, 3, 2}, {0, 2, 1, 3}}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 35, 33, 37, {2, 2}, {2, 2}, per));
+        }
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 35, 33, 37, {1, 1}, {1, 1},
+            {0, 1, 2, 3}, 43));
     }
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
@@ -9760,6 +9792,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // Matched UNO Q precision sweep. Filter explicitly: m=768,n=256,k=768.
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_F16, GGML_TYPE_F32}) {
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 768, 256, 768, {1, 1}, {1, 1}));
+    }
 
     // Conv2d: K=CRS=NPQ=4096 matmul performance
     uint32_t                        iwh_idx  = 0;
