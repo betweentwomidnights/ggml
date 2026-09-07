@@ -771,6 +771,8 @@ struct ggml_backend_opencl_context {
     bool kernel_mul_mat_f16_f32_tiled_valid = false;
     cl_kernel kernel_mul_mat_f16_f32_small = nullptr;
     cl_kernel kernel_mul_mat_f32_f32_small = nullptr;
+    cl_kernel kernel_mul_mat_f16_f32_small_batched = nullptr;
+    cl_kernel kernel_mul_mat_f32_f32_small_batched = nullptr;
     cl_kernel kernel_adreno_xmem_pack_src_f32;
     cl_kernel kernel_adreno_xmem_prepack_weight_f16;
     cl_kernel kernel_gemm_xmem_f16_f32_os8;
@@ -2298,7 +2300,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         backend_ctx->kernel_mul_mat_f16_f32_tiled_valid = max_wg >= 128;
         if (getenv("GGML_OPENCL_RUSTICL_SUBGROUP32_COMPAT") != nullptr) {
             for (auto entry : {std::make_pair("mul_mat_f16_f32_small", &backend_ctx->kernel_mul_mat_f16_f32_small),
-                               std::make_pair("mul_mat_f32_f32_small", &backend_ctx->kernel_mul_mat_f32_f32_small)}) {
+                               std::make_pair("mul_mat_f32_f32_small", &backend_ctx->kernel_mul_mat_f32_f32_small),
+                               std::make_pair("mul_mat_f16_f32_small_batched", &backend_ctx->kernel_mul_mat_f16_f32_small_batched),
+                               std::make_pair("mul_mat_f32_f32_small_batched", &backend_ctx->kernel_mul_mat_f32_f32_small_batched)}) {
                 cl_kernel small = clCreateKernel(backend_ctx->program_mul_mat_f16_f32_tiled, entry.first, &err);
                 CL_CHECK(err);
                 CL_CHECK(clGetKernelWorkGroupInfo(small, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE,
@@ -15509,7 +15513,10 @@ static bool ggml_cl_mul_mat_float_small(ggml_backend_t backend, const ggml_tenso
         dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) || b->ne[1] <= 1) {
         return false;
     }
-    cl_kernel kernel = a->type == GGML_TYPE_F16 ? ctx->kernel_mul_mat_f16_f32_small : ctx->kernel_mul_mat_f32_f32_small;
+    const bool batched = b->ne[2]*b->ne[3] > 1;
+    cl_kernel kernel = a->type == GGML_TYPE_F16 ?
+        (batched ? ctx->kernel_mul_mat_f16_f32_small_batched : ctx->kernel_mul_mat_f16_f32_small) :
+        (batched ? ctx->kernel_mul_mat_f32_f32_small_batched : ctx->kernel_mul_mat_f32_f32_small);
     if (kernel == nullptr) return false;
     auto * ea = (ggml_tensor_extra_cl *) a->extra;
     auto * eb = (ggml_tensor_extra_cl *) b->extra;
@@ -15526,25 +15533,43 @@ static bool ggml_cl_mul_mat_float_small(ggml_backend_t backend, const ggml_tenso
     CL_CHECK(clSetKernelArg(kernel, 10, sizeof(am), &am));
     CL_CHECK(clSetKernelArg(kernel, 11, sizeof(bk), &bk));
     CL_CHECK(clSetKernelArg(kernel, 12, sizeof(bn), &bn));
-    size_t local[] = {32, 1};
-    const int columns = ggml_cl_rusticl_gemm_columns(a, b, 1);
-    const int64_t r2 = b->ne[2]/a->ne[2], r3 = b->ne[3]/a->ne[3];
-    for (int64_t i3 = 0; i3 < b->ne[3]; ++i3) {
-        for (int64_t i2 = 0; i2 < b->ne[2]; ++i2) {
-            const cl_ulong ao = ea->offset + a->view_offs + (i2/r2)*a->nb[2] + (i3/r3)*a->nb[3];
-            const cl_ulong bo = eb->offset + b->view_offs + i2*b->nb[2] + i3*b->nb[3];
-            const cl_ulong co = ed->offset + dst->view_offs + i2*dst->nb[2] + i3*dst->nb[3];
-            CL_CHECK(clSetKernelArg(kernel, 4, sizeof(ao), &ao));
-            for (int start = 0; start < N; start += columns) {
-                const int count = std::min(columns, N - start);
-                const cl_ulong bo_tile = bo + start*bn;
-                const cl_ulong co_tile = co + start*dst->nb[1];
-                CL_CHECK(clSetKernelArg(kernel, 1, sizeof(count), &count));
-                CL_CHECK(clSetKernelArg(kernel, 6, sizeof(bo_tile), &bo_tile));
-                CL_CHECK(clSetKernelArg(kernel, 8, sizeof(co_tile), &co_tile));
-                size_t global[] = {(size_t) CEIL_DIV(M, 32)*32, (size_t) CEIL_DIV(count, 32)};
-                ctx->enqueue_ndrange_kernel(kernel, 2, global, local, dst);
-            }
+    // Attention has many small independent heads/blocks. Launch them in the Z
+    // dimension rather than paying a serialized queue round-trip per batch.
+    const cl_ulong strides[] = {a->nb[2], a->nb[3], b->nb[2], b->nb[3], dst->nb[2], dst->nb[3]};
+    for (cl_uint i = 0; i < 6; ++i) {
+        CL_CHECK(clSetKernelArg(kernel, 13 + i, sizeof(cl_ulong), &strides[i]));
+    }
+    const int ne12 = b->ne[2], r2 = b->ne[2]/a->ne[2], r3 = b->ne[3]/a->ne[3];
+    CL_CHECK(clSetKernelArg(kernel, 19, sizeof(ne12), &ne12));
+    CL_CHECK(clSetKernelArg(kernel, 20, sizeof(r2), &r2));
+    CL_CHECK(clSetKernelArg(kernel, 21, sizeof(r3), &r3));
+    const cl_ulong ao = ea->offset + a->view_offs;
+    const cl_ulong bo = eb->offset + b->view_offs;
+    const cl_ulong co = ed->offset + dst->view_offs;
+    CL_CHECK(clSetKernelArg(kernel, 4, sizeof(ao), &ao));
+    size_t local[] = {32, 1, 1};
+    const int batches = b->ne[2]*b->ne[3];
+    int max_batches = 64;
+    if (const char * value = getenv("GGML_OPENCL_RUSTICL_GEMM_MAX_BATCHES")) {
+        const auto parsed = std::from_chars(value, value + strlen(value), max_batches);
+        GGML_ASSERT(parsed.ec == std::errc() && parsed.ptr == value + strlen(value) && max_batches > 0);
+    }
+    const double min_column_work = 2.0*M*K*std::min(N, 32);
+    max_batches = std::min({batches, max_batches,
+        std::max(1, int(std::min<double>(batches, 500000000.0/min_column_work)))});
+    const int columns = ggml_cl_rusticl_gemm_columns(a, b, max_batches);
+    for (int batch_start = 0; batch_start < batches; batch_start += max_batches) {
+        const int batch_count = std::min(max_batches, batches - batch_start);
+        CL_CHECK(clSetKernelArg(kernel, 22, sizeof(batch_start), &batch_start));
+        for (int start = 0; start < N; start += columns) {
+            const int count = std::min(columns, N - start);
+            const cl_ulong bo_tile = bo + start*bn;
+            const cl_ulong co_tile = co + start*dst->nb[1];
+            CL_CHECK(clSetKernelArg(kernel, 1, sizeof(count), &count));
+            CL_CHECK(clSetKernelArg(kernel, 6, sizeof(bo_tile), &bo_tile));
+            CL_CHECK(clSetKernelArg(kernel, 8, sizeof(co_tile), &co_tile));
+            size_t global[] = {(size_t) CEIL_DIV(M, 32)*32, (size_t) CEIL_DIV(count, 32), (size_t) batch_count};
+            ctx->enqueue_ndrange_kernel(kernel, 3, global, local, dst);
         }
     }
     return true;
@@ -19114,7 +19139,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
     // GEMM using local memory
     // Current BK = 16, so ne00 % 16 == 0
-    // Opt-in Rusticl K-quant GEMM uses a 32x32 tile / 32 work-items. Other
+    // Opt-in Rusticl K-quant GEMM uses a 32x32 tile / 64 work-items. Other
     // 64x64 / 128-work-item kernels still exceed FD702's per-kernel limits.
     const bool rusticl_small_tile = getenv("GGML_OPENCL_RUSTICL_SUBGROUP32_COMPAT") != nullptr;
     const bool rusticl_tiled_k = rusticl_small_tile && getenv("GGML_OPENCL_RUSTICL_TILED_K") != nullptr &&
@@ -19572,7 +19597,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
                 kernel = backend_ctx->kernel_mul_mm_q4_k_f32_l4_lm;
                 const int tile = rusticl_small_tile ? 32 : 64;
-                nth0 = tile*tile/(4*8); // must match BM, BN, TM, TN in the kernel
+                nth0 = rusticl_small_tile ? 64 : 128; // TM=2 versus 4, TN=8
                 if (rusticl_small_tile && backend_ctx->get_kernel_workgroup_size(kernel) < (size_t)nth0) break;
 
                 int batch_stride_a = ne00*ne01;
@@ -19660,7 +19685,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
                 kernel = backend_ctx->kernel_mul_mm_q6_k_f32_l4_lm;
                 const int tile = rusticl_small_tile ? 32 : 64;
-                nth0 = tile*tile/(4*8);
+                nth0 = rusticl_small_tile ? 64 : 128; // must match the Q6_K tile
                 if (rusticl_small_tile && backend_ctx->get_kernel_workgroup_size(kernel) < (size_t)nth0) break;
 
                 int batch_stride_a = ne00*ne01;

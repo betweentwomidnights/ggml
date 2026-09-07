@@ -4,16 +4,34 @@
 #define LOAD_VEC_B 4
 
 #ifdef GGML_OPENCL_RUSTICL_SUBGROUP32_COMPAT
+// FD702: 64 work-items, 16 accumulators/thread, 4 KiB local storage.
+// Keep probe overrides local to this compatibility path.
 #define BM 32
 #define BN 32
+#define UNROLL_REG _Pragma("unroll")
+#ifndef BK
+#define BK 16
+#endif
+#ifndef TM
+#define TM 2
+#endif
 #else
 #define BM 64
 #define BN 64
-#endif
+#define UNROLL_REG
 #define BK 32
 #define TM 4
+#endif
+#ifndef TN
 #define TN 8
+#endif
+#ifndef K_UNROLL
+#define K_UNROLL
+#endif
 
+#ifdef GGML_OPENCL_RUSTICL_SUBGROUP32_COMPAT
+__attribute__((reqd_work_group_size((BM/TM)*(BN/TN), 1, 1)))
+#endif
 kernel void kernel_mul_mm_q4_k_f32_l4_lm(
     global uchar4 * src0_q,
     global uchar  * src0_s,
@@ -79,6 +97,7 @@ kernel void kernel_mul_mm_q4_k_f32_l4_lm(
     float cache_a[TM];
     float cache_b[TN];
 
+    UNROLL_REG
     for (int i = 0; i < TM * TN; i++) {
         sums[i] = 0.0f;
     }
@@ -150,16 +169,21 @@ kernel void kernel_mul_mm_q4_k_f32_l4_lm(
         pos_a += BK / LOAD_VEC_A;
         pos_b += BK / LOAD_VEC_B;
 
+        K_UNROLL
         for (int i = 0; i < BK; i++) {
+            UNROLL_REG
             for (int j = 0; j < TM; j++) {
                 cache_a[j] = buf_a[(i) * BM + th_r * TM + j];
             }
 
+            UNROLL_REG
             for (int j = 0; j < TN; j++) {
                 cache_b[j] = buf_b[(i) * BN + th_c * TN + j];
             }
 
+            UNROLL_REG
             for (int cc = 0; cc < TN; cc++) {
+                UNROLL_REG
                 for (int cr = 0; cr < TM; cr++) {
                     const int sums_idx = cc*TM + cr;
                     sums[sums_idx] = mad(cache_a[cr], cache_b[cc], sums[sums_idx]);
@@ -174,7 +198,9 @@ kernel void kernel_mul_mm_q4_k_f32_l4_lm(
 
     const int offsets = batch_idx * batch_stride_d;
 
+    UNROLL_REG
     for (int cc = 0; cc < TN; cc++) {
+        UNROLL_REG
         for (int cr = 0; cr < TM; cr++) {
             if (dr + cr < ne01 && dc + cc < ne11) {
                 dst[offsets + (dc + cc) * stride_d + dr + cr] = sums[cc * TM + cr];

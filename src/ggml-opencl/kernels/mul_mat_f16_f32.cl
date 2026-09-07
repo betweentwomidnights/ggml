@@ -3,10 +3,17 @@
 #ifdef GGML_OPENCL_RUSTICL_SUBGROUP32_COMPAT
 // 32 work-items, 32x32 output tile, 8.25 KiB shared storage. Both weight
 // precisions use FP32 accumulation. Byte strides also support attention views.
-#define SMALL_FLOAT_GEMM(NAME, TYPE) \
+#define SMALL_FLOAT_GEMM(NAME, TYPE, BATCHED) \
 __kernel void NAME(int M, int N, int K, \
     __global const char * A, ulong ao, __global const char * B, ulong bo, \
-    __global char * C, ulong co, ulong ak, ulong am, ulong bk, ulong bn) { \
+    __global char * C, ulong co, ulong ak, ulong am, ulong bk, ulong bn, \
+    ulong a2, ulong a3, ulong b2, ulong b3, ulong c2, ulong c3, int ne12, int r2, int r3, int batch_start) { \
+    if (BATCHED) { \
+        const int batch = batch_start + get_group_id(2), i2 = batch % ne12, i3 = batch / ne12; \
+        ao += (i2/r2)*a2 + (i3/r3)*a3; \
+        bo += i2*b2 + i3*b3; \
+        co += i2*c2 + i3*c3; \
+    } \
     __local float la[32][33]; \
     __local float lb[32][33]; \
     const int tid = get_local_id(0); \
@@ -41,8 +48,12 @@ __kernel void NAME(int M, int N, int K, \
         } \
     } \
 }
-SMALL_FLOAT_GEMM(mul_mat_f16_f32_small, half)
-SMALL_FLOAT_GEMM(mul_mat_f32_f32_small, float)
+// Specialize the single-matrix case: batch indexing otherwise increases FD702
+// register pressure even when the launch only has one matrix.
+SMALL_FLOAT_GEMM(mul_mat_f16_f32_small, half, 0)
+SMALL_FLOAT_GEMM(mul_mat_f32_f32_small, float, 0)
+SMALL_FLOAT_GEMM(mul_mat_f16_f32_small_batched, half, 1)
+SMALL_FLOAT_GEMM(mul_mat_f32_f32_small_batched, float, 1)
 #undef SMALL_FLOAT_GEMM
 #endif
 
