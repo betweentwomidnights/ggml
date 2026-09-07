@@ -1482,7 +1482,21 @@ struct ggml_backend_cuda_context {
         if (cublas_handles[device] == nullptr) {
             ggml_cuda_set_device(device);
             CUBLAS_CHECK(cublasCreate(&cublas_handles[device]));
-            CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device], CUBLAS_TF32_TENSOR_OP_MATH));
+            // TF32 keeps 10 mantissa bits, so with this math mode every F32 GEMM that
+            // reaches cuBLAS computes at roughly half precision whatever the tensors say.
+            // That is a good trade for language models and a poor one for deep
+            // convolutional stacks, where the error accumulates layer over layer: a 16-layer
+            // SEANet audio encoder loses ~1.5e-4 of cosine similarity against float32 torch.
+            //
+            // Callers cannot otherwise opt out. ggml_mul_mat_set_prec(GGML_PREC_F32) and
+            // GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32 both only select CUBLAS_COMPUTE_32F, which
+            // this math mode then downgrades anyway.
+            //
+            // GGML_CUDA_TF32=0 restores full F32 accumulation. The default is unchanged.
+            const char * tf32 = getenv("GGML_CUDA_TF32");
+            const bool allow_tf32 = !(tf32 && tf32[0] == '0');
+            CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device],
+                allow_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH));
         }
         return cublas_handles[device];
     }
