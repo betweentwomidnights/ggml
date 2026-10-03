@@ -4345,6 +4345,26 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// GGML_PREC_F32 on every MUL_MAT. Backends may route these to different kernels (Vulkan keeps
+// F32 x F32 operands in fp32 and reads src0 in place), so they need their own coverage.
+struct test_mul_mat_prec_f32 : public test_mul_mat {
+    using test_mul_mat::test_mul_mat;
+
+    std::string vars() override {
+        return test_mul_mat::vars() + ",prec=f32";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_mul_mat::build_graph(ctx);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op == GGML_OP_MUL_MAT) {
+                ggml_mul_mat_set_prec(t, GGML_PREC_F32);
+            }
+        }
+        return out;
+    }
+};
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -9000,6 +9020,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // the batches of a are padded, nb[2] is not a multiple of nb[1]
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 8, 1, 64, {8, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, 16, 16));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 8, 16, 64, {8, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, 16, 16));
+    // GGML_PREC_F32 F32 x F32: contiguous, strided and padded batches, aligned and split-k sizes
+    test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_F32, GGML_TYPE_F32, 8,  16, 64, {8, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, 5120));
+    test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_F32, GGML_TYPE_F32, 64, 64, 64, {8, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, 5120));
+    test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_F32, GGML_TYPE_F32, 8,  16, 64, {8, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, 16, 16));
+    test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_F32, GGML_TYPE_F32, 33, 47, 71, {2, 3}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_F32, GGML_TYPE_F32, 128, 128, 128, {2, 1}, {2, 1}));
+    test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_F32, GGML_TYPE_F32, 256, 256, 4096, {1, 1}, {1, 1}));
     // as is a view whose experts are strided by more rows than it uses
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F32, GGML_TYPE_F32, 4, 2, false, 8,  1, 64, 64));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 4, 2, false, 8, 16, 64, 64));
