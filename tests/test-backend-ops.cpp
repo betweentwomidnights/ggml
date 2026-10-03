@@ -4354,6 +4354,11 @@ struct test_mul_mat_prec_f32 : public test_mul_mat {
         return test_mul_mat::vars() + ",prec=f32";
     }
 
+    // fp16 operands land near 1e-7, fp32 accumulation-order noise near 1e-11
+    double max_nmse_err() override {
+        return 1e-8;
+    }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * out = test_mul_mat::build_graph(ctx);
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {

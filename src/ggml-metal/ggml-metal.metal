@@ -10464,13 +10464,14 @@ kernel void kernel_mul_mm(
         ushort tiitg[[thread_index_in_threadgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
 
-    threadgroup S0 * sa = (threadgroup S0 *)(shmem);
-    threadgroup S1 * sb = (threadgroup S1 *)(shmem + 4096);
-
     constexpr int NR0 = 64;
     constexpr int NR1 = 32;
 
     constexpr int NK  = 32;
+
+    // sb follows sa's NR0 x NK tile: 4096 bytes for half, 8192 for the fp32 (_prec) variant
+    threadgroup S0 * sa = (threadgroup S0 *)(shmem);
+    threadgroup S1 * sb = (threadgroup S1 *)(shmem + NR0*NK*sizeof(S0));
     constexpr int NL0 = NK/16;
     constexpr int NL1 = NK/8;
 
@@ -11044,6 +11045,8 @@ kernel void kernel_mul_mm_id(
 typedef decltype(kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, float4x4, 1, dequantize_f32, float, float4x4, float, float2x4>) mul_mm_t;
 
 template [[host_name("kernel_mul_mm_f32_f32")]]     kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   float4x4,      1,     dequantize_f32,     float,  float4x4,  float, float2x4>;
+// GGML_PREC_F32: both operands stay fp32 in threadgroup memory (the variant above rounds them to half)
+template [[host_name("kernel_mul_mm_f32_f32_prec")]] kernel mul_mm_t kernel_mul_mm<float,  float4x4,  simdgroup_float8x8,  float,  float2x4,  simdgroup_float8x8,  float4x4,      1,     dequantize_f32,     float,  float4x4,  float, float2x4>;
 template [[host_name("kernel_mul_mm_f16_f32")]]     kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   half4x4,       1,     dequantize_f16,     half,   half4x4,   float, float2x4>;
 #if defined(GGML_METAL_HAS_BF16)
 template [[host_name("kernel_mul_mm_bf16_f32")]]    kernel mul_mm_t kernel_mul_mm<bfloat, bfloat4x4, simdgroup_bfloat8x8, bfloat, bfloat2x4, simdgroup_bfloat8x8, bfloat4x4,     1,     dequantize_bf16,    bfloat, bfloat4x4, float, float2x4>;
