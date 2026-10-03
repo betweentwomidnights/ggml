@@ -9479,6 +9479,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_pad_reflect_1d());
     test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {3000, 384, 4, 1}));
+    // SEANet conv padding: time-major rows, small asymmetric pads, one side possibly empty
+    test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {24000, 64, 1, 1}, 3, 3));
+    test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {4801, 512, 1, 1}, 3, 6));
+    test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {1000, 8, 1, 1}, 0, 5));
+    test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {1000, 8, 1, 1}, 5, 0));
     test_cases.emplace_back(new test_roll());
     test_cases.emplace_back(new test_arange());
     test_cases.emplace_back(new test_arange(GGML_TYPE_F32, 0.0f, 1048576.0f, 1.0f));
