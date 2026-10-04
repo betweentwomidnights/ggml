@@ -461,11 +461,16 @@ static fs::path get_executable_path() {
 #endif
 }
 
+// GGML_LIBRARY_PREFIX (CMake) prefixes every shared library's file name; look for the same.
+#ifndef GGML_LIBRARY_PREFIX
+#define GGML_LIBRARY_PREFIX ""
+#endif
+
 static fs::path backend_filename_prefix() {
 #ifdef _WIN32
-    return fs::u8path("ggml-");
+    return fs::u8path(GGML_LIBRARY_PREFIX "ggml-");
 #else
-    return fs::u8path("libggml-");
+    return fs::u8path("lib" GGML_LIBRARY_PREFIX "ggml-");
 #endif
 }
 
