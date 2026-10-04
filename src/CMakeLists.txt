@@ -258,6 +258,10 @@ endif()
 
 target_link_libraries(ggml PUBLIC ggml-base)
 
+if (GGML_LIBRARY_PREFIX)
+    target_compile_definitions(ggml PRIVATE GGML_LIBRARY_PREFIX="${GGML_LIBRARY_PREFIX}")
+endif()
+
 if (CMAKE_SYSTEM_NAME MATCHES "Linux")
     target_link_libraries(ggml PRIVATE dl)
 endif()
