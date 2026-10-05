@@ -59,7 +59,11 @@ void main() {
 
             if (ai0 < p.ne20 && k < p.ne01) {
                 const uint ai = a3*p.nb03 + a2*p.nb02 + k*p.nb01 + ai0*p.nb00;
+#if defined(DATA_A_BF16)
+                tile_a[tk][ti] = bf16_to_fp32(uint32_t(data_a[get_aoffset() + ai]));
+#else
                 tile_a[tk][ti] = float(data_a[get_aoffset() + ai]);
+#endif
             } else {
                 tile_a[tk][ti] = 0.0;
             }
