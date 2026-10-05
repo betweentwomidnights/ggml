@@ -22,6 +22,24 @@ The previous 0.16 training history is also retained as a merge parent.
     Q6_K, Q8_0), including Vulkan's paired tile loads.
 12. GGUF tensor-dimension accessor compatibility.
 13. Metal `OUT_PROD` simdgroup-matrix capability guard for unsupported older devices.
+14. Vulkan BF16 frozen weights in `OUT_PROD`, with F32 gradients and accumulation.
+
+## Vulkan BF16 backward support
+
+BF16 frozen-base training needs `OUT_PROD` even though the base weights are not
+updated: gradients must propagate through their projections to the adapters.
+The Vulkan variant decodes BF16's uint16 storage into F32 before using the
+existing tiled accumulation. It does not narrow the weights to F16 or require
+native BF16 arithmetic; gradient and output types remain F32.
+
+`test-vulkan-out-prod` compares against an independent scalar reference because
+the CPU backend lacks BF16 `OUT_PROD` and a backend comparison would skip it.
+It checks F32/F16 controls, BF16 rounding and exponent range, partial tiles,
+batched/broadcast inputs, padded src0 rows and transposed F32 gradients on every
+available Vulkan device. Missing BF16 support fails; a machine without Vulkan
+devices reports a CTest skip. An explicitly requested missing device fails.
+
+The provenance and August validation below describe the original shared port.
 
 ## Candidate provenance and validation
 

@@ -865,6 +865,7 @@ void process_shaders() {
 
     string_to_spv("out_prod_f32", "out_prod.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}});
     string_to_spv("out_prod_f16", "out_prod.comp", {{"A_TYPE", "float16_t"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}});
+    string_to_spv("out_prod_bf16", "out_prod.comp", {{"DATA_A_BF16", "1"}, {"A_TYPE", "uint16_t"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}});
 
     // Quantized src0, for the mul_mat backward against a quantized (frozen) weight -- i.e. LoRA
     // training on a quantized base. Scoped to the k-quants a q4_k_m / q5_k_m / q8_0 mix actually
