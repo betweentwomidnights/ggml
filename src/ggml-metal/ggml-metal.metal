@@ -5290,6 +5290,73 @@ kernel void kernel_im2col(
 template [[host_name("kernel_im2col_f32")]] kernel im2col_t kernel_im2col<float>;
 template [[host_name("kernel_im2col_f16")]] kernel im2col_t kernel_im2col<half>;
 
+// For small batches: kernel_im2col maps the batch onto threads, which leaves only KH*KW threads
+// per threadgroup when N == 1. Here a threadgroup gathers a TILE_W x TILE_C block of output
+// columns x input channels into threadgroup memory (reads coalesced along the image row), then
+// writes each output column's TILE_C*KH*KW contiguous values (writes coalesced along dst rows).
+template <typename T>
+kernel void kernel_im2col_tiled(
+        constant ggml_metal_kargs_im2col & args,
+        device const float * x,
+        device        char * dst,
+        threadgroup  char  * shmem_c [[threadgroup(0)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],  // [ceil(OW/TILE_W), ceil(IC/TILE_C), OH*N]
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]]) {     // [TILE_W, TILE_C, 1]
+    const int32_t TW  = GGML_METAL_IM2COL_TILE_W;
+    const int32_t TC  = GGML_METAL_IM2COL_TILE_C;
+    const int32_t KHW = args.KHW;
+    const int32_t LD  = TC*KHW + 1; // padded to spread threadgroup memory banks
+
+    threadgroup T * shmem = (threadgroup T *) shmem_c;
+
+    const int32_t ow0 = tgpig[0]*TW;
+    const int32_t ic0 = tgpig[1]*TC;
+    const int32_t ioh = tgpig[2] % args.OH;
+    const int32_t in  = tgpig[2] / args.OH;
+
+    {
+        const int32_t iow = ow0 + tpitg[0];
+        const int32_t iic = ic0 + tpitg[1];
+        if (iow < args.OW && iic < args.IC) {
+            device const float * src = x + in*args.ofs0 + iic*args.ofs1;
+            threadgroup T * row = shmem + tpitg[0]*LD + tpitg[1]*KHW;
+            for (int32_t k = 0; k < KHW; k++) {
+                const int32_t ikh = k / args.KW;
+                const int32_t ikw = k - ikh*args.KW;
+                const int32_t iiw = iow*args.s0 + ikw*args.d0 - args.p0;
+                const int32_t iih = ioh*args.s1 + ikh*args.d1 - args.p1;
+                row[k] = (iih < 0 || iih >= args.IH || iiw < 0 || iiw >= args.IW) ? (T) 0.0f : (T) src[(int64_t)iih*args.IW + iiw];
+            }
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int32_t nw = min(TW, args.OW - ow0);
+    const int32_t L  = min(TC, args.IC - ic0)*KHW;
+
+    device T * pdst = (device T *) dst + ((int64_t)(in*args.OH + ioh)*args.OW + ow0)*args.CHW + ic0*KHW;
+
+    for (int32_t e = tpitg[1]*ntg[0] + tpitg[0]; e < nw*L; e += ntg[0]*ntg[1]) {
+        const int32_t w = e / L;
+        const int32_t j = e - w*L;
+        pdst[(int64_t)w*args.CHW + j] = shmem[w*LD + j];
+    }
+}
+
+typedef void (im2col_tiled_t)(
+        constant ggml_metal_kargs_im2col & args,
+        device const float * x,
+        device        char * dst,
+        threadgroup  char  * shmem_c [[threadgroup(0)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]]);
+
+template [[host_name("kernel_im2col_tiled_f32")]] kernel im2col_tiled_t kernel_im2col_tiled<float>;
+template [[host_name("kernel_im2col_tiled_f16")]] kernel im2col_tiled_t kernel_im2col_tiled<half>;
+
 // TODO: optimize
 typedef void (im2col_ext_t)(
         constant ggml_metal_kargs_im2col & args,

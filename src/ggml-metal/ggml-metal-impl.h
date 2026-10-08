@@ -719,6 +719,12 @@ typedef struct {
     int32_t  d1;    // dilation y
 } ggml_metal_kargs_conv_2d_dw;
 
+// below this batch size im2col tiles the output (kernel_im2col_tiled) instead of mapping the batch onto threads
+#define GGML_METAL_IM2COL_TILED_MAX_N 32
+#define GGML_METAL_IM2COL_TILE_W 32  // output columns per threadgroup
+#define GGML_METAL_IM2COL_TILE_C 8   // input channels per threadgroup
+#define GGML_METAL_IM2COL_TILED_MAX_KHW 25 // keeps the tile within 32 KB of threadgroup memory
+
 typedef struct {
     uint64_t  ofs0;
     uint64_t  ofs1;
@@ -735,6 +741,9 @@ typedef struct {
     int32_t  KH;
     int32_t  KW;
     int32_t  KHW; // KH * KW, pre-computed on CPU to save GPU resources
+    int32_t  IC;
+    int32_t  OW;
+    int32_t  OH;
 } ggml_metal_kargs_im2col;
 
 typedef struct {

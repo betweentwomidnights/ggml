@@ -1850,7 +1850,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_im2col(ggml_meta
     char base[256];
     char name[256];
 
-    if (KH*KW <= 1024) {
+    const int64_t N = op->src[1]->ne[is_2D ? 3 : 2];
+
+    if (N < GGML_METAL_IM2COL_TILED_MAX_N && KH*KW <= GGML_METAL_IM2COL_TILED_MAX_KHW) {
+        snprintf(base, 256, "kernel_im2col_tiled_%s", ggml_type_name(op->type));
+    } else if (KH*KW <= 1024) {
         snprintf(base, 256, "kernel_im2col_%s", ggml_type_name(op->type));
     } else {
         snprintf(base, 256, "kernel_im2col_ext_%s", ggml_type_name(op->type));

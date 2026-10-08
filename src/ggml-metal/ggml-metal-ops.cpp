@@ -3980,11 +3980,25 @@ int ggml_metal_op_im2col(ggml_metal_op_t ctx, int idx) {
         /*.KH   =*/ KH,
         /*.KW   =*/ KW,
         /*.KHW  =*/ KH * KW,
+        /*.IC   =*/ IC,
+        /*.OW   =*/ OW,
+        /*.OH   =*/ OH,
     };
 
     auto pipeline = ggml_metal_library_get_pipeline_im2col(lib, op);
 
-    if (KH*KW <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
+    if (N < GGML_METAL_IM2COL_TILED_MAX_N && KH*KW <= GGML_METAL_IM2COL_TILED_MAX_KHW) {
+        const int TW = GGML_METAL_IM2COL_TILE_W;
+        const int TC = GGML_METAL_IM2COL_TILE_C;
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 1);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
+        ggml_metal_encoder_set_threadgroup_memory_size(enc, GGML_PAD(TW*(TC*KH*KW + 1)*ggml_type_size(op->type), 16), 0);
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, (OW + TW - 1)/TW, (IC + TC - 1)/TC, OH*N, TW, TC, 1);
+    } else if (KH*KW <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
         const uint64_t ntptg0 = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)/(KH*KW), N);
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);
