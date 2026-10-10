@@ -5648,7 +5648,15 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_sgd_f32, "opt_step_sgd_f32", opt_step_sgd_f32_len, opt_step_sgd_f32_data, "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
     // conv2d, conv_transpose_2d, conv3d
-    for (uint32_t s = 0; s < CONV_SHAPE_COUNT; ++s) {
+    // Each shape is set up twice: once for F16 kernels, once for F32 kernels. F32 kernels always
+    // take the scalar shader, which stages tiles in fp32 shared memory and accumulates with fp32
+    // FMA. The coopmat shaders round both operands to fp16 (and cm1/cm2 also accumulate in fp16),
+    // which the F16-kernel variants keep using.
+    for (uint32_t i = 0; i < 2 * CONV_SHAPE_COUNT; ++i) {
+        const uint32_t s = i % CONV_SHAPE_COUNT;
+        const bool conv2d_f32_knl = i >= CONV_SHAPE_COUNT;
+        const bool conv2d_use_cm2 = device->coopmat2 && !conv2d_f32_knl;
+
         // smaller WG for the small-tile fallback gives more concurrent WGs per SM
         uint32_t conv2d_WG_SIZE  = (s == CONV_SHAPE_64x32) ? 128 : 256;
         uint32_t use_collectives = 0;  // Enables subgroup ops for preventing the re-calculation of indices.
@@ -5658,7 +5666,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         bool conv2d_UNROLL = true;
 
 #if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
-        if (device->coopmat2) {
+        if (conv2d_use_cm2) {
             conv2d_SHMEM_PAD = 8; // 8 float16_t
         }
 #endif
@@ -5695,7 +5703,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         // subgroup_size_control to force the driver to actually use it.
         bool conv2d_use_cm1 = false;
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
-        conv2d_use_cm1 = !device->coopmat2 &&
+        conv2d_use_cm1 = !device->coopmat2 && !conv2d_f32_knl &&
                          device->coopmat_support && device->coopmat_support_16x16x16_f16acc &&
                          device->subgroup_size_control &&
                          (device->subgroup_size == 32 || device->subgroup_size == 64) &&
@@ -5736,13 +5744,13 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         // stage cm2 accumulator through shmem for coalesced global stores;
         // skipped on 128x128 where the extra Csh footprint hurts occupancy.
         // cm1 always uses the staged path.
-        uint32_t conv2d_csh_store = (device->coopmat2 && s != CONV_SHAPE_128x128) ? 1u : 0u;
+        uint32_t conv2d_csh_store = (conv2d_use_cm2 && s != CONV_SHAPE_128x128) ? 1u : 0u;
         if (conv2d_use_cm1) {
             conv2d_csh_store = 1;
         }
 
         // shmem is fp16 on cm2/cm1 (matches Csh), fp32 on scalar
-        const bool conv2d_use_fp16_shmem = device->coopmat2 || conv2d_use_cm1;
+        const bool conv2d_use_fp16_shmem = conv2d_use_cm2 || conv2d_use_cm1;
 
         // shrink CRS if the non-cm1 config still doesn't fit
         if (device->properties.limits.maxComputeSharedMemorySize < shmem_req(conv2d_SHMEM_PAD, conv2d_csh_store, conv2d_use_fp16_shmem)) {
@@ -5782,12 +5790,15 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 sizeof(vk_op_conv2d_push_constants), wg_denoms, spec_constants_cpy, 1, true, use_collectives || conv2d_required_subgroup_size, conv2d_required_subgroup_size);    \
         }
 #define CREATE_CONVS(spv_suffix) \
-        CREATE_CONV(conv2d, _f32, spv_suffix) \
-        CREATE_CONV(conv2d, _f16_f32, spv_suffix) \
-        CREATE_CONV(conv_transpose_2d, _f32, spv_suffix) \
-        CREATE_CONV(conv_transpose_2d, _f16_f32, spv_suffix)
+        if (conv2d_f32_knl) { \
+            CREATE_CONV(conv2d, _f32, spv_suffix) \
+            CREATE_CONV(conv_transpose_2d, _f32, spv_suffix) \
+        } else { \
+            CREATE_CONV(conv2d, _f16_f32, spv_suffix) \
+            CREATE_CONV(conv_transpose_2d, _f16_f32, spv_suffix) \
+        }
 #if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
-        if (device->coopmat2) {
+        if (conv2d_use_cm2) {
             CREATE_CONVS(_cm2)
         } else
 #endif
@@ -5830,25 +5841,28 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 conv3d##type_suffix##spv_suffix##_len, conv3d##type_suffix##spv_suffix##_data, "main", 3, \
                 sizeof(vk_op_conv3d_push_constants), wg_denoms, spec_constants_cpy, 1, true, conv2d_required_subgroup_size != 0, conv2d_required_subgroup_size); \
         }
+#define CREATE_CONV3DS(spv_suffix) \
+        if (conv2d_f32_knl) { \
+            CREATE_CONV3D(_f32, spv_suffix) \
+        } else { \
+            CREATE_CONV3D(_f16_f32, spv_suffix) \
+        }
 #if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
-        if (device->coopmat2) {
-            CREATE_CONV3D(_f32, _cm2)
-            CREATE_CONV3D(_f16_f32, _cm2)
+        if (conv2d_use_cm2) {
+            CREATE_CONV3DS(_cm2)
         } else
 #endif
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
         if (conv2d_use_cm1) {
-            CREATE_CONV3D(_f32, _cm1)
-            CREATE_CONV3D(_f16_f32, _cm1)
+            CREATE_CONV3DS(_cm1)
         } else
 #endif
         if (conv2d_UNROLL) {
-            CREATE_CONV3D(_f32, _unroll)
-            CREATE_CONV3D(_f16_f32, _unroll)
+            CREATE_CONV3DS(_unroll)
         } else {
-            CREATE_CONV3D(_f32, )
-            CREATE_CONV3D(_f16_f32, )
+            CREATE_CONV3DS( )
         }
+#undef CREATE_CONV3DS
 #undef CREATE_CONV3D
     }
 
