@@ -19,6 +19,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
+#include "../src/ggml-quants.h"
 
 #include <algorithm>
 #include <atomic>
@@ -4342,6 +4343,61 @@ struct test_mul_mat : public test_case {
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return ggml_op_name(GGML_OP_MUL_MAT);
+    }
+};
+
+// A small Q4_K super-block scale must be divided in float before applying
+// the integer sub-block scale. d=17 half subnormal units becomes 1 instead
+// of 17/16 units when d/16 is evaluated in half. The high nibbles and large
+// sub-block scales keep the final nonzero weights in the normal half range.
+struct test_q4_k_small_scale : public test_case {
+    const ggml_op op;
+    const int n;
+    const ggml_half d;
+
+    test_q4_k_small_scale(ggml_op op, int n, ggml_half d) : op(op), n(n), d(d) {}
+
+    std::string vars() override {
+        return "type=q4_K,small_scale=" + std::to_string(d) + ",n=" + std::to_string(n);
+    }
+
+    double max_nmse_err() override { return 1e-6; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * a = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_K, QK_K, 64);
+        ggml_set_name(a, "small_scale_weights");
+        if (op == GGML_OP_GET_ROWS) {
+            auto * rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n);
+            return ggml_get_rows(ctx, a, rows);
+        }
+        auto * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, op == GGML_OP_MUL_MAT ? QK_K : n,
+                                     op == GGML_OP_MUL_MAT ? n : 64);
+        ggml_set_name(b, "small_scale_input");
+        return op == GGML_OP_MUL_MAT ? ggml_mul_mat(ctx, a, b) : ggml_out_prod(ctx, a, b);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "small_scale_weights") == 0) {
+                std::vector<block_q4_K> data(ggml_nelements(t) / QK_K);
+                for (auto & block : data) {
+                    block.d = d;
+                    block.dmin = 0;
+                    memset(block.scales, 63, sizeof(block.scales));
+                    memset(block.qs, 0xf0, sizeof(block.qs));
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "small_scale_input") == 0) {
+                std::vector<float> data(ggml_nelements(t), 1.0f);
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) data[i] = i % 64;
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
     }
 };
 
@@ -9043,6 +9099,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // the batches of a are padded, nb[2] is not a multiple of nb[1]
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 8, 1, 64, {8, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, 16, 16));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 8, 16, 64, {8, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, 16, 16));
+    for (ggml_half d : {17, 33, 257}) {
+        for (int n : {1, 16, 452}) {
+            test_cases.emplace_back(new test_q4_k_small_scale(GGML_OP_MUL_MAT, n, d));
+        }
+        test_cases.emplace_back(new test_q4_k_small_scale(GGML_OP_GET_ROWS, 16, d));
+        test_cases.emplace_back(new test_q4_k_small_scale(GGML_OP_OUT_PROD, 16, d));
+    }
     // GGML_PREC_F32 F32 x F32: contiguous, strided and padded batches, aligned and split-k sizes
     test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_F32, GGML_TYPE_F32, 8,  16, 64, {8, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, 5120));
     test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_F32, GGML_TYPE_F32, 64, 64, 64, {8, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, 5120));
