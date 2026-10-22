@@ -1,3 +1,7 @@
+add_executable(test-concat-backward test-concat-backward.cpp)
+target_link_libraries(test-concat-backward PRIVATE ggml)
+add_test(NAME test-concat-backward COMMAND $<TARGET_FILE:test-concat-backward> CPU)
+
 if (GGML_VULKAN)
     add_executable(test-vulkan-out-prod test-vulkan-out-prod.cpp)
     target_link_libraries(test-vulkan-out-prod PRIVATE ggml)

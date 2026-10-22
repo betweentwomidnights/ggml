@@ -6684,6 +6684,12 @@ static void ggml_compute_backward(
             // [0, src0->ne[dim]) slab along dim, src1 the remainder. (Needed for the DiT inpaint
             // local-cond path's backward — sa3.cpp training. Forward concat is unchanged.)
             const int dim = ggml_get_op_params_i32(tensor, 0);
+            // A downstream transpose/permute can return a gradient whose
+            // innermost stride is not the element size. ggml_view_4d fixes
+            // nb[0] to the element size, so materialize before slicing slabs.
+            if (!ggml_is_contiguous(grad)) {
+                grad = ggml_cont(ctx, grad);
+            }
             if (src0_needs_grads) {
                 struct ggml_tensor * gv = ggml_view_4d(ctx, grad,
                     src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
