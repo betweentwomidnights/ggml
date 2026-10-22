@@ -6,6 +6,11 @@ constant short FC_bin_f  [[function_constant(FC_BIN + 1)]];
 constant bool  FC_bin_rb [[function_constant(FC_BIN + 2)]];
 constant bool  FC_bin_cb [[function_constant(FC_BIN + 3)]];
 
+// Scalar byte strides advance four elements in vectorized f32/f16 kernels.
+template<typename T> constexpr uint bin_stride_width() { return 1; }
+template<> constexpr uint bin_stride_width<float4>() { return 4; }
+template<> constexpr uint bin_stride_width<half4>() { return 4; }
+
 template <typename T0, typename T1, typename T>
 kernel void kernel_bin_fuse_impl(
         constant ggml_metal_kargs_bin & args,
@@ -88,67 +93,74 @@ kernel void kernel_bin_fuse_impl(
         const int i12 = i02%args.ne12;
         const int i11 = i01%args.ne11;
 
-        device const T0 * src0_ptr = (device const T0 *) (src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01 + args.offs);
-        device       T  * dst_ptr  = (device       T  *) (dst  + i03*args.nb3  + i02*args.nb2  + i01*args.nb1  + args.offs);
+        device const char * src0_ptr = src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01 + args.offs;
+        device       char * dst_ptr  = dst  + i03*args.nb3  + i02*args.nb2  + i01*args.nb1  + args.offs;
+
+        const uint step0 = bin_stride_width<T0>();
+        const uint step1 = bin_stride_width<T1>();
+        const uint step  = bin_stride_width<T>();
 
         if (FC_F == 1) {
-            device const T1 * src1_ptr = (device const T1 *) (src1 + args.o1[0] + i13*args.nb13 + i12*args.nb12 + i11*args.nb11);
+            device const char * src1_ptr = src1 + args.o1[0] + i13*args.nb13 + i12*args.nb12 + i11*args.nb11;
 
             for (int i0 = tpitg.x; i0 < args.ne0; i0 += ntg.x) {
                 const int i10 = FC_CB ? i0%args.ne10 : i0;
+                const T0 x0 = *((device const T0 *) (src0_ptr + i0*args.nb00*step0));
+                const T1 x1 = *((device const T1 *) (src1_ptr + i10*args.nb10*step1));
+                device T * out = (device T *) (dst_ptr + i0*args.nb0*step);
 
                 if (FC_OP == 0) {
-                    dst_ptr[i0] = src0_ptr[i0] + src1_ptr[i10];
+                    *out = x0 + x1;
                 }
 
                 if (FC_OP == 1) {
-                    dst_ptr[i0] = src0_ptr[i0] - src1_ptr[i10];
+                    *out = x0 - x1;
                 }
 
                 if (FC_OP == 2) {
-                    dst_ptr[i0] = src0_ptr[i0] * src1_ptr[i10];
+                    *out = x0 * x1;
                 }
 
                 if (FC_OP == 3) {
-                    dst_ptr[i0] = src0_ptr[i0] / src1_ptr[i10];
+                    *out = x0 / x1;
                 }
             }
         } else {
-            device const T1 * src1_ptr[8];
+            device const char * src1_ptr[8];
             FOR_UNROLL (short j = 0; j < FC_F; ++j) {
-                src1_ptr[j] = (device const T1 *) (src1 + args.o1[j] + i13*args.nb13 + i12*args.nb12 + i11*args.nb11);
+                src1_ptr[j] = src1 + args.o1[j] + i13*args.nb13 + i12*args.nb12 + i11*args.nb11;
             }
 
             for (int i0 = tpitg.x; i0 < args.ne0; i0 += ntg.x) {
                 const int i10 = FC_CB ? i0%args.ne10 : i0;
 
-                T res = src0_ptr[i0];
+                T res = *((device const T0 *) (src0_ptr + i0*args.nb00*step0));
 
                 if (FC_OP == 0) {
                     FOR_UNROLL (short j = 0; j < FC_F; ++j) {
-                        res += src1_ptr[j][i10];
+                        res += *((device const T1 *) (src1_ptr[j] + i10*args.nb10*step1));
                     }
                 }
 
                 if (FC_OP == 1) {
                     FOR_UNROLL (short j = 0; j < FC_F; ++j) {
-                        res -= src1_ptr[j][i10];
+                        res -= *((device const T1 *) (src1_ptr[j] + i10*args.nb10*step1));
                     }
                 }
 
                 if (FC_OP == 2) {
                     FOR_UNROLL (short j = 0; j < FC_F; ++j) {
-                        res *= src1_ptr[j][i10];
+                        res *= *((device const T1 *) (src1_ptr[j] + i10*args.nb10*step1));
                     }
                 }
 
                 if (FC_OP == 3) {
                     FOR_UNROLL (short j = 0; j < FC_F; ++j) {
-                        res /= src1_ptr[j][i10];
+                        res /= *((device const T1 *) (src1_ptr[j] + i10*args.nb10*step1));
                     }
                 }
 
-                dst_ptr[i0] = res;
+                *((device T *) (dst_ptr + i0*args.nb0*step)) = res;
             }
         }
     }

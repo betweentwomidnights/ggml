@@ -5334,6 +5334,42 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// GGML_PREC_F32 on every MUL_MAT. Backends may route these to different kernels (Vulkan keeps
+// F32 x F32 operands in fp32 and reads src0 in place), so they need their own coverage.
+struct test_mul_mat_prec_f32 : public test_mul_mat {
+    using test_mul_mat::test_mul_mat;
+
+    std::string vars() override {
+        return test_mul_mat::vars() + ",prec=f32";
+    }
+
+    // fp16 operands land near 1e-7, fp32 accumulation-order noise near 1e-11
+    double max_nmse_err() override {
+        return 1e-8;
+    }
+
+    // CUDA hands F32 GEMMs to cuBLAS with TF32 enabled, which ignores GGML_PREC_F32 and lands
+    // near 7e-8, unless GGML_CUDA_TF32=0. Keep the default bound there so the suite stays green
+    // on a stock CUDA build; with TF32 off, CUDA is held to the fp32 bound like everyone else.
+    double max_nmse_err(ggml_backend_t backend) override {
+        const char * tf32 = getenv("GGML_CUDA_TF32");
+        if (strncmp(ggml_backend_name(backend), "CUDA", 4) == 0 && !(tf32 && tf32[0] == '0')) {
+            return test_mul_mat::max_nmse_err();
+        }
+        return max_nmse_err();
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_mul_mat::build_graph(ctx);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op == GGML_OP_MUL_MAT) {
+                ggml_mul_mat_set_prec(t, GGML_PREC_F32);
+            }
+        }
+        return out;
+    }
+};
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -5755,6 +5791,54 @@ struct test_out_prod : public test_case {
         ggml_set_name(out, "out");
 
         return out;
+    }
+};
+
+// Backward regression for the LoRA initialization invariant. Since lora_B is
+// initialized to zero, the first-step gradient of lora_A must also be zero.
+// This graph reaches lora_A through MUL_MAT's transposed OUT_PROD backward path.
+struct test_lora_zero_b : public test_case {
+    std::string vars() override {
+        return "in=8,rank=4,out=6,tokens=3";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 8, 3);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 8, 4);
+        ggml_set_name(a, "lora_A");
+        ggml_set_param(a);
+
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 6);
+        ggml_set_name(b, "lora_B");
+        ggml_set_param(b);
+
+        ggml_tensor * ax = ggml_mul_mat(ctx, a, x);
+        ggml_set_name(ax, "lora_A_x");
+        ggml_tensor * out = ggml_mul_mat(ctx, b, ax);
+        ggml_set_name(out, "lora_zero_B_out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            if (strcmp(t->name, "lora_B") == 0) {
+                ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "LORA_ZERO_B";
     }
 };
 
@@ -10484,6 +10568,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, v, eps));
             }
         }
+        // row lengths that are not a multiple of 32, for the scalar (33) and float4 (132, 260) paths
+        for (uint32_t n : { 33, 132, 260 }) {
+            for (bool v : { false, true }) {
+                test_cases.emplace_back(new test_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, v, eps));
+                test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, v, eps));
+            }
+        }
     }
 
     // in-place tests
@@ -10936,6 +11027,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // the batches of a are padded, nb[2] is not a multiple of nb[1]
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 8, 1, 64, {8, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 16, 16));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 8, 16, 64, {8, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 16, 16));
+    // Preserve full-F32 precision controls after upstream added src_overlap.
+    test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_F32, GGML_TYPE_F32, 8, 16, 64, {8, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 5120));
+    test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_F32, GGML_TYPE_F32, 64, 64, 64, {8, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 5120));
+    test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_F32, GGML_TYPE_F32, 8, 16, 64, {8, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 16, 16));
+    test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_F32, GGML_TYPE_F32, 33, 47, 71, {2, 3}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_F32, GGML_TYPE_F32, 128, 128, 128, {2, 1}, {2, 1}));
+    test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_F32, GGML_TYPE_F32, 256, 256, 4096, {1, 1}, {1, 1}));
     // as is a view whose experts are strided by more rows than it uses
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F32, GGML_TYPE_F32, 4, 2, false, 8,  1, 64, 1.0f, 64));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 4, 2, false, 8, 16, 64, 1.0f, 64));
@@ -11143,6 +11241,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32,
                                                   256, 16, 16, {1, 1}, {nr2, 1}));
     }
+
+    // Backprop through MUL_MAT supplies OUT_PROD with a transposed F32 gradient.
+    // Cover both trainable F32 and frozen F16 left operands using LoRA-like dimensions.
+    test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32,
+                                              64, 16, 32, {1, 1}, {1, 1}, true));
+    test_cases.emplace_back(new test_out_prod(GGML_TYPE_F16, GGML_TYPE_F32,
+                                              64, 16, 32, {1, 1}, {1, 1}, true));
+    // Exercise partial M/N/K tiles in both supported src0 precisions.
+    test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32,
+                                              65, 17, 23, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_out_prod(GGML_TYPE_F16, GGML_TYPE_F32,
+                                              65, 17, 23, {1, 1}, {1, 1}, true));
+    // Frozen cross-attention projection backward used by SA3 Metal training.
+    test_cases.emplace_back(new test_out_prod(GGML_TYPE_F16, GGML_TYPE_F32,
+                                              1024, 257, 2048, {1, 1}, {1, 1}, true));
+    // Training a LoRA on a quantized base reaches OUT_PROD with a quantized src0.
+    // base_types covers Q4_K and Q8_0 but not Q5_K or Q6_K, and a q4_k_m mix emits
+    // Q6_K for the tensors it keeps at higher precision, so name them explicitly.
+    for (ggml_type type_a : {GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        test_cases.emplace_back(new test_out_prod(type_a, GGML_TYPE_F32,
+                                                  256, 16, 16, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_out_prod(type_a, GGML_TYPE_F32,
+                                                  1024, 257, 2048, {1, 1}, {1, 1}, true));
+    }
+    test_cases.emplace_back(new test_lora_zero_b());
 
     // add_id
     for (ggml_type type_a : {GGML_TYPE_F32}) {
@@ -11529,6 +11652,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 1, 1}, {256, 16, 1, 1}, -1));
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {256, 16, 2, 3}, -1));
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {128, 16, 2, 3}, -1));
+    test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {2048, 257, 1, 1}, {1024, 257, 1, 1}, -1));
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {256, 16, 2, 3}, 1));
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {128, 16, 2, 3}, 2));
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {64, 16, 2, 3}, 3));
@@ -11556,6 +11680,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_pad_reflect_1d());
     test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {3000, 384, 4, 1}));
+    // SEANet conv padding: time-major rows, small asymmetric pads, one side possibly empty
+    test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {24000, 64, 1, 1}, 3, 3));
+    test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {4801, 512, 1, 1}, 3, 6));
+    test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {1000, 8, 1, 1}, 0, 5));
+    test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {1000, 8, 1, 1}, 5, 0));
     test_cases.emplace_back(new test_roll());
     test_cases.emplace_back(new test_roll(3, -2, 1, -1, true));
     test_cases.emplace_back(new test_arange());

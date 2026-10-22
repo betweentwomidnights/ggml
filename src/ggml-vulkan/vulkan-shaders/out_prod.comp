@@ -2,58 +2,102 @@
 
 #extension GL_EXT_shader_16bit_storage : require
 
-layout (push_constant) uniform parameter
-{
-    uint ne;
-    uint ne00; uint ne01; uint ne02; uint ne03; uint nb00; uint nb01; uint nb02; uint nb03;
-    uint ne10; uint ne11; uint ne12; uint ne13; uint nb10; uint nb11; uint nb12; uint nb13;
-    uint ne20; uint ne21; uint ne22; uint ne23; uint nb20; uint nb21; uint nb22; uint nb23;
-    uint misalign_offsets;
-    float param1; float param2; int param3;
-} p;
+#include "types.glsl"
+#include "generic_binary_head.glsl"
 
-layout (binding = 0) readonly buffer A {float data_a[];};
-layout (binding = 1) readonly buffer B {float data_b[];};
-layout (binding = 2) writeonly buffer D {float data_d[];};
+// OUT_PROD is a matrix multiplication over ne01:
+//   dst[i0, i1] = sum_k src0[i0, k] * src1[i1, k]
+//
+// The original implementation assigned one output element to each invocation,
+// making every invocation reload both complete input vectors from device memory.
+// A 16x16 workgroup instead stages matching input tiles in shared memory, so each
+// value is reused by 16 output elements. The +1 padding avoids shared-memory bank
+// conflicts when a column is read during the inner product.
+const uint TILE = 16;
+const uint WORKGROUP = 8;
 
-uint get_idx() {
-    return gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
-}
+// A 64-thread workgroup computes the same 16x16 output tile as the original
+// 256-thread version. Each invocation owns a 2x2 output block. This keeps the
+// global/shared-memory traffic unchanged while exposing four independent dot
+// products per invocation, which is substantially friendlier to iGPU occupancy.
+layout(local_size_x = WORKGROUP, local_size_y = WORKGROUP, local_size_z = 1) in;
 
-uint get_aoffset() { return p.misalign_offsets >> 16; }
-uint get_boffset() { return (p.misalign_offsets >> 8) & 0xFF; }
-uint get_doffset() { return p.misalign_offsets & 0xFF; }
-
-layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+shared float tile_a[TILE][TILE + 1];
+shared float tile_b[TILE][TILE + 1];
 
 void main() {
-    uint idx = get_idx();
-    if (idx >= p.ne) {
-        return;
+    const uint lx = gl_LocalInvocationID.x;
+    const uint ly = gl_LocalInvocationID.y;
+    const uint local_idx = ly * WORKGROUP + lx;
+    const uint base_i0 = gl_WorkGroupID.x * TILE;
+    const uint base_i1 = gl_WorkGroupID.y * TILE;
+    const uint i00 = base_i0 + lx;
+    const uint i01 = base_i0 + lx + WORKGROUP;
+    const uint i10 = base_i1 + ly;
+    const uint i11 = base_i1 + ly + WORKGROUP;
+    const uint batch = gl_WorkGroupID.z;
+    const uint i2 = batch % p.ne22;
+    const uint i3 = batch / p.ne22;
+
+    const uint r2 = p.ne22 / p.ne02;
+    const uint r3 = p.ne23 / p.ne03;
+    const uint a2 = i2 / r2;
+    const uint a3 = i3 / r3;
+
+    float sum00 = 0.0;
+    float sum01 = 0.0;
+    float sum10 = 0.0;
+    float sum11 = 0.0;
+    for (uint k0 = 0; k0 < p.ne01; k0 += TILE) {
+        // 64 invocations cooperatively load 256 elements from each input tile.
+        [[unroll]] for (uint load = local_idx; load < TILE*TILE; load += WORKGROUP*WORKGROUP) {
+            const uint tk = load / TILE;
+            const uint ti = load % TILE;
+            const uint k = k0 + tk;
+            const uint ai0 = base_i0 + ti;
+            const uint bi1 = base_i1 + ti;
+
+            if (ai0 < p.ne20 && k < p.ne01) {
+                const uint ai = a3*p.nb03 + a2*p.nb02 + k*p.nb01 + ai0*p.nb00;
+#if defined(DATA_A_BF16)
+                tile_a[tk][ti] = bf16_to_fp32(uint32_t(data_a[get_aoffset() + ai]));
+#else
+                tile_a[tk][ti] = float(data_a[get_aoffset() + ai]);
+#endif
+            } else {
+                tile_a[tk][ti] = 0.0;
+            }
+
+            if (bi1 < p.ne21 && k < p.ne01) {
+                const uint bi = i3*p.nb13 + i2*p.nb12 + k*p.nb11 + bi1*p.nb10;
+                tile_b[tk][ti] = float(data_b[get_boffset() + bi]);
+            } else {
+                tile_b[tk][ti] = 0.0;
+            }
+        }
+
+        barrier();
+
+        [[unroll]] for (uint kk = 0; kk < TILE; ++kk) {
+            const float a0 = tile_a[kk][lx];
+            const float a1 = tile_a[kk][lx + WORKGROUP];
+            const float b0 = tile_b[kk][ly];
+            const float b1 = tile_b[kk][ly + WORKGROUP];
+            sum00 += a0 * b0;
+            sum01 += a0 * b1;
+            sum10 += a1 * b0;
+            sum11 += a1 * b1;
+        }
+
+        barrier();
     }
 
-    uint tmp = idx;
-    uint i0 = tmp % p.ne20; tmp /= p.ne20;
-    uint i1 = tmp % p.ne21; tmp /= p.ne21;
-    uint i2 = tmp % p.ne22; tmp /= p.ne22;
-    uint i3 = tmp;
-
-    uint a_i0 = i0 % p.ne00;
-    uint a_i2 = i2 / (p.ne22 / p.ne02);
-    uint a_i3 = i3 / (p.ne23 / p.ne03);
-
-    uint b_i0 = i1 % p.ne10;
-    uint b_i2 = i2;
-    uint b_i3 = i3;
-
-    float sum = 0.0f;
-    uint K = p.ne01;
-    for (uint k = 0; k < K; k++) {
-        uint aoff = get_aoffset() + a_i3*p.nb03 + a_i2*p.nb02 + k*p.nb01 + a_i0*p.nb00;
-        uint boff = get_boffset() + b_i3*p.nb13 + b_i2*p.nb12 + k*p.nb11 + b_i0*p.nb10;
-        sum += data_a[aoff] * data_b[boff];
-    }
-
-    uint doff = get_doffset() + i3*p.nb23 + i2*p.nb22 + i1*p.nb21 + i0*p.nb20;
-    data_d[doff] = sum;
+    if (i00 < p.ne20 && i10 < p.ne21)
+        data_d[get_doffset() + dst_idx(i00, i10, i2, i3)] = D_TYPE(sum00);
+    if (i00 < p.ne20 && i11 < p.ne21)
+        data_d[get_doffset() + dst_idx(i00, i11, i2, i3)] = D_TYPE(sum01);
+    if (i01 < p.ne20 && i10 < p.ne21)
+        data_d[get_doffset() + dst_idx(i01, i10, i2, i3)] = D_TYPE(sum10);
+    if (i01 < p.ne20 && i11 < p.ne21)
+        data_d[get_doffset() + dst_idx(i01, i11, i2, i3)] = D_TYPE(sum11);
 }

@@ -259,10 +259,11 @@ struct vk_matmul_pipeline_key {
     ggml_type type_b;
     bool mul_mat_id;
     bool f16acc;
+    bool f32_operands = false; // full-F32 operand staging, independent of accumulator type
 
     bool operator<(const vk_matmul_pipeline_key & o) const {
-        return std::tie(type_a, type_b, mul_mat_id, f16acc)
-             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc);
+        return std::tie(type_a, type_b, mul_mat_id, f16acc, f32_operands)
+             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc, o.f32_operands);
     }
 };
 
@@ -953,6 +954,12 @@ struct vk_device_struct {
     vk_pipeline pipeline_col2im_1d_f16;
     vk_pipeline pipeline_col2im_1d_bf16;
     vk_pipeline pipeline_out_prod_f32;
+    vk_pipeline pipeline_out_prod_f16;
+    vk_pipeline pipeline_out_prod_bf16;
+    vk_pipeline pipeline_out_prod_q4_k;
+    vk_pipeline pipeline_out_prod_q5_k;
+    vk_pipeline pipeline_out_prod_q6_k;
+    vk_pipeline pipeline_out_prod_q8_0;
     vk_pipeline pipeline_snake_f32;
     vk_pipeline pipeline_snake_f16;
     vk_pipeline pipeline_snake_bf16;

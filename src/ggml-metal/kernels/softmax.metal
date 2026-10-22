@@ -221,3 +221,28 @@ template [[host_name("kernel_soft_max_f16")]]   kernel kernel_soft_max_t   kerne
 template [[host_name("kernel_soft_max_f32")]]   kernel kernel_soft_max_t   kernel_soft_max<float>;
 template [[host_name("kernel_soft_max_f16_4")]] kernel kernel_soft_max_4_t kernel_soft_max_4<half4>;
 template [[host_name("kernel_soft_max_f32_4")]] kernel kernel_soft_max_4_t kernel_soft_max_4<float4>;
+
+kernel void kernel_soft_max_back_f32(
+        constant ggml_metal_kargs_soft_max_back & args,
+        device const char * grad,
+        device const char * y,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]]) {
+    device const float * grad_row = (device const float *)
+        (grad + tgpig.x*args.nb01 + tgpig.y*args.nb02 + tgpig.z*args.nb03);
+    device const float * y_row = (device const float *)
+        (y + tgpig.x*args.nb11 + tgpig.y*args.nb12 + tgpig.z*args.nb13);
+    device float * dst_row = (device float *)
+        (dst + tgpig.x*args.nb1 + tgpig.y*args.nb2 + tgpig.z*args.nb3);
+
+    float dot_yg = 0.0f;
+    for (int i0 = tpitg.x; i0 < args.ne00; i0 += 32) {
+        dot_yg += y_row[i0]*grad_row[i0];
+    }
+    dot_yg = simd_sum(dot_yg);
+
+    for (int i0 = tpitg.x; i0 < args.ne00; i0 += 32) {
+        dst_row[i0] = args.scale*(grad_row[i0] - dot_yg)*y_row[i0];
+    }
+}

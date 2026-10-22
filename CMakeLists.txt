@@ -86,6 +86,23 @@ option(BUILD_SHARED_LIBS           "ggml: build shared libraries" ${BUILD_SHARED
 option(GGML_BACKEND_DL             "ggml: build backends as dynamic libraries (requires BUILD_SHARED_LIBS)" OFF)
 set(GGML_BACKEND_DIR "" CACHE PATH "ggml: directory to load dynamic backends from (requires GGML_BACKEND_DL")
 
+# Give every shared ggml library a distinct file name (prefix "stems-": stems-ggml.dll,
+# stems-ggml-base.dll, stems-ggml-vulkan.dll, ...); the dynamic backend loader looks for the
+# same names. Windows binds an import to any already-loaded DLL of the same name, whatever its
+# folder, so two applications that each ship ggml.dll and load into one process (plugins in a
+# DAW) would otherwise share whichever copy loaded first, even across ggml versions.
+set(GGML_LIBRARY_PREFIX "" CACHE STRING "ggml: prefix for shared library file names (requires BUILD_SHARED_LIBS)")
+if (GGML_LIBRARY_PREFIX)
+    if (NOT BUILD_SHARED_LIBS)
+        message(FATAL_ERROR "GGML_LIBRARY_PREFIX requires BUILD_SHARED_LIBS")
+    endif()
+    if (NOT GGML_LIBRARY_PREFIX MATCHES "^[A-Za-z0-9_.-]+$")
+        message(FATAL_ERROR "GGML_LIBRARY_PREFIX may only contain letters, digits, '_', '.' and '-'")
+    endif()
+    set(CMAKE_SHARED_LIBRARY_PREFIX "${CMAKE_SHARED_LIBRARY_PREFIX}${GGML_LIBRARY_PREFIX}")
+    set(CMAKE_SHARED_MODULE_PREFIX  "${CMAKE_SHARED_MODULE_PREFIX}${GGML_LIBRARY_PREFIX}")
+endif()
+
 #
 # option list
 #

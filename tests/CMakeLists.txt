@@ -1,4 +1,9 @@
-find_library(MATH_LIBRARY m)
+if (GGML_VULKAN)
+    add_executable(test-vulkan-out-prod test-vulkan-out-prod.cpp)
+    target_link_libraries(test-vulkan-out-prod PRIVATE ggml)
+    add_test(NAME test-vulkan-out-prod COMMAND $<TARGET_FILE:test-vulkan-out-prod>)
+    set_tests_properties(test-vulkan-out-prod PROPERTIES SKIP_RETURN_CODE 77)
+endif()
 
 # check systems
 if (NOT UNAME_S)

@@ -1534,7 +1534,12 @@ struct ggml_backend_cuda_context {
         if (cublas_handles[device][curr_stream_no] == nullptr) {
             ggml_cuda_set_device(device);
             CUBLAS_CHECK(cublasCreate(&cublas_handles[device][curr_stream_no]));
-            CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device][curr_stream_no], CUBLAS_TF32_TENSOR_OP_MATH));
+            // Audio parity/training can opt out of TF32 without changing the
+            // upstream per-stream handle and workspace lifetime.
+            const char * tf32 = getenv("GGML_CUDA_TF32");
+            const bool allow_tf32 = !(tf32 && tf32[0] == '0');
+            CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device][curr_stream_no],
+                allow_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH));
             CUBLAS_CHECK(cublasSetStream(cublas_handles[device][curr_stream_no], stream()));
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && (CUBLAS_VER_MAJOR > 11 || (CUBLAS_VER_MAJOR == 11 && CUBLAS_VER_MINOR >= 2))
             if (cublas_workspace_sizes[device] == 0) {

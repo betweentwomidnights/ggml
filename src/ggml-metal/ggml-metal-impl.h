@@ -302,6 +302,33 @@ typedef struct {
 } ggml_metal_kargs_repeat;
 
 typedef struct {
+    int32_t  ne00;
+    int32_t  ne01;
+    int32_t  ne02;
+    int32_t  ne03;
+    uint64_t nb00;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    int32_t  ne10;
+    int32_t  ne11;
+    int32_t  ne12;
+    int32_t  ne13;
+    uint64_t nb10;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    int32_t  ne0;
+    int32_t  ne1;
+    int32_t  ne2;
+    int32_t  ne3;
+    uint64_t nb0;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+} ggml_metal_kargs_out_prod;
+
+typedef struct {
     int64_t  nk0;
     int64_t  ne00;
     int64_t  ne01;
@@ -763,6 +790,12 @@ typedef struct {
     int32_t  d1;    // dilation y
 } ggml_metal_kargs_conv_2d_dw;
 
+// below this batch size im2col tiles the output (kernel_im2col_tiled) instead of mapping the batch onto threads
+#define GGML_METAL_IM2COL_TILED_MAX_N 32
+#define GGML_METAL_IM2COL_TILE_W 32  // output columns per threadgroup
+#define GGML_METAL_IM2COL_TILE_C 8   // input channels per threadgroup
+#define GGML_METAL_IM2COL_TILED_MAX_KHW 25 // keeps the tile within 32 KB of threadgroup memory
+
 typedef struct {
     uint64_t  ofs0;
     uint64_t  ofs1;
@@ -779,6 +812,9 @@ typedef struct {
     int32_t  KH;
     int32_t  KW;
     int32_t  KHW; // KH * KW, pre-computed on CPU to save GPU resources
+    int32_t  IC;
+    int32_t  OW;
+    int32_t  OH;
 } ggml_metal_kargs_im2col;
 
 typedef struct {
@@ -914,6 +950,20 @@ typedef struct {
     float    m1;
     int32_t  n_head_log2;
 } ggml_metal_kargs_soft_max;
+
+typedef struct {
+    int32_t  ne00;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+    float    scale;
+} ggml_metal_kargs_soft_max_back;
 
 typedef struct {
     int64_t  ne00;

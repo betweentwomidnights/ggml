@@ -216,6 +216,45 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_repeat(ggml_meta
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_repeat_back(ggml_metal_library_t lib) {
+    const char * name = "kernel_repeat_back_f32";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_out_prod(
+        ggml_metal_library_t lib, ggml_type tsrc0) {
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_out_prod_%s_f32", ggml_type_name(tsrc0));
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rms_norm_back(ggml_metal_library_t lib) {
+    const char * name = "kernel_rms_norm_back_f32";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    res.smem = 64*sizeof(float);
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_concat(ggml_metal_library_t lib, ggml_type tsrc) {
     char base[256];
     char name[256];
@@ -546,6 +585,18 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc(ggml_met
 
     return res;
 }
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_soft_max_back(ggml_metal_library_t lib) {
+    const char * name = "kernel_soft_max_back_f32";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
 
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv(
         ggml_metal_library_t lib, const ggml_tensor * op, int32_t nc, bool use_silu) {
@@ -945,7 +996,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     const int16_t r2   = (int16_t) (ne12 / op->src[0]->ne[2]);
     const int16_t r3   = (int16_t) (ne13 / op->src[0]->ne[3]);
 
-    snprintf(base, 256, "kernel_mul_mm_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+    // GGML_PREC_F32 on F32 x F32 keeps both operands fp32 in threadgroup memory
+    const bool prec_f32 = !has_tensor && tsrc0 == GGML_TYPE_F32 && tsrc1 == GGML_TYPE_F32 &&
+                          ggml_get_op_params_i32(op, 0) == GGML_PREC_F32;
+
+    snprintf(base, 256, "kernel_mul_mm_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), prec_f32 ? "_prec" : "");
     snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d",
              base, bc_inp, bc_out, ne12, ne13, r2, r3);
 
@@ -975,7 +1030,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
         res.nr0 = 64;
         res.nr1 = 32;
 
-        res.smem = bc_out ? 8192 : (4096 + 2048);
+        // sa (64 x 32) + sb (32 x 32) tiles; the bounds-checked store reuses it as a 64 x 32 float tile
+        res.smem = prec_f32 ? (8192 + 4096) : (bc_out ? 8192 : (4096 + 2048));
     }
 
     res.nsg = N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y;
@@ -2097,7 +2153,10 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_bin(ggml_metal_l
     const char * t1_str = ggml_type_name(op->src[1]->type);
     const char * t_str  = ggml_type_name(op->type);
 
-    const bool is_c4 = (op->src[0]->ne[0] % 4 == 0) && (op->src[1]->ne[0] % 4 == 0);
+    const bool is_c4 = (op->src[0]->ne[0] % 4 == 0) && (op->src[1]->ne[0] % 4 == 0) &&
+                       op->src[0]->nb[0] == ggml_element_size(op->src[0]) &&
+                       op->src[1]->nb[0] == ggml_element_size(op->src[1]) &&
+                       op->nb[0] == ggml_element_size(op);
 
     const bool is_cb = op->src[0]->ne[0] != op->src[1]->ne[0];
     const bool is_rb = ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && (ggml_nrows(op->src[1]) == 1) && ggml_nelements(op) < 65536;
@@ -2348,7 +2407,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_im2col(ggml_meta
     char base[256];
     char name[256];
 
-    if (KH*KW <= 1024) {
+    const int64_t N = op->src[1]->ne[is_2D ? 3 : 2];
+
+    if (N < GGML_METAL_IM2COL_TILED_MAX_N && KH*KW <= GGML_METAL_IM2COL_TILED_MAX_KHW) {
+        snprintf(base, 256, "kernel_im2col_tiled_%s", ggml_type_name(op->type));
+    } else if (KH*KW <= 1024) {
         snprintf(base, 256, "kernel_im2col_%s", ggml_type_name(op->type));
     } else {
         snprintf(base, 256, "kernel_im2col_ext_%s", ggml_type_name(op->type));

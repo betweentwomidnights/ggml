@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <vector>
 
 // ggml_compute_forward_dup
 
@@ -6820,36 +6821,71 @@ static void ggml_compute_forward_im2col_f32(
     const int64_t OH = is_2D ? ne2 : 1;
     const int64_t OW = ne1;
 
-    int ofs0 = is_2D ? nb13 : nb12;
-    int ofs1 = is_2D ? nb12 : nb11;
+    const int64_t ofs0 = is_2D ? nb13 : nb12;
+    const int64_t ofs1 = is_2D ? nb12 : nb11;
 
     GGML_ASSERT(nb10 == sizeof(float));
 
     // im2col: [N, IC, IH, IW] => [N, OH, OW, IC*KH*KW]
+    // Threads take contiguous blocks of output columns (in, ioh, iow): splitting over IC instead
+    // had every thread writing short interleaved runs into the same cache lines.
     {
         float * const wdata = (float *) dst->data;
 
-        for (int64_t in = 0; in < N; in++) {
-            for (int64_t ioh = 0; ioh < OH; ioh++) { // 1
-                for (int64_t iow = 0; iow < OW; iow++) {
-                    for (int64_t iic = ith; iic < IC; iic += nth) {
+        const int64_t CHW = IC*KH*KW;
+        const int64_t np  = N*OH*OW;
+        const int64_t dp  = (np + nth - 1)/nth;
+        const int64_t ip0 = dp*ith;
+        const int64_t ip1 = MIN(ip0 + dp, np);
 
-                        // micro kernel
-                        float * dst_data = wdata + (in*OH*OW + ioh*OW + iow)*(IC*KH*KW); // [IC, KH, KW]
-                        const float * const src_data = (float *)((char *) src1->data + in*ofs0 + iic*ofs1); // [IH, IW]
+        // source row of each (iic, ikh) for the current output row, nullptr in the padding
+        std::vector<const float *> src_rows(IC*KH);
+        int64_t row = -1;
 
-                        for (int64_t ikh = 0; ikh < KH; ikh++) {  // 1
-                            for (int64_t ikw = 0; ikw < KW; ikw++) {
-                                const int64_t iiw = iow*s0 + ikw*d0 - p0;
-                                const int64_t iih = ioh*s1 + ikh*d1 - p1;
+        for (int64_t ip = ip0; ip < ip1; ip++) {
+            const int64_t ir  = ip/OW;
+            const int64_t iow = ip - ir*OW;
 
-                                if (iih < 0 || iih >= IH || iiw < 0 || iiw >= IW) {
-                                    dst_data[iic*(KH*KW) + ikh*KW + ikw] = 0;
-                                } else {
-                                    dst_data[iic*(KH*KW) + ikh*KW + ikw] = (src_data[iih*IW + iiw]);
-                                }
-                            }
+            if (ir != row) {
+                row = ir;
+                const int64_t in  = ir/OH;
+                const int64_t ioh = ir - in*OH;
+                for (int64_t iic = 0; iic < IC; iic++) {
+                    const float * const src_data = (const float *)((const char *) src1->data + in*ofs0 + iic*ofs1); // [IH, IW]
+                    for (int64_t ikh = 0; ikh < KH; ikh++) {
+                        const int64_t iih = ioh*s1 + ikh*d1 - p1;
+                        src_rows[iic*KH + ikh] = (iih < 0 || iih >= IH) ? nullptr : src_data + iih*IW;
+                    }
+                }
+            }
+
+            float * dst_data = wdata + ip*CHW; // [IC, KH, KW]
+            const int64_t iiw0 = iow*s0 - p0;
+
+            if (iiw0 >= 0 && iiw0 + (KW - 1)*d0 < IW) {
+                // interior column: every tap is in bounds
+                for (int64_t r = 0; r < IC*KH; r++, dst_data += KW) {
+                    const float * const src_row = src_rows[r];
+                    if (src_row == nullptr) {
+                        for (int64_t ikw = 0; ikw < KW; ikw++) {
+                            dst_data[ikw] = 0;
                         }
+                    } else if (KW == 3 && d0 == 1) {
+                        dst_data[0] = src_row[iiw0];
+                        dst_data[1] = src_row[iiw0 + 1];
+                        dst_data[2] = src_row[iiw0 + 2];
+                    } else {
+                        for (int64_t ikw = 0; ikw < KW; ikw++) {
+                            dst_data[ikw] = src_row[iiw0 + ikw*d0];
+                        }
+                    }
+                }
+            } else {
+                for (int64_t r = 0; r < IC*KH; r++, dst_data += KW) {
+                    const float * const src_row = src_rows[r];
+                    for (int64_t ikw = 0; ikw < KW; ikw++) {
+                        const int64_t iiw = iiw0 + ikw*d0;
+                        dst_data[ikw] = (src_row == nullptr || iiw < 0 || iiw >= IW) ? 0 : src_row[iiw];
                     }
                 }
             }
@@ -7303,6 +7339,59 @@ static void ggml_call_mul_mat(ggml_type type, const ggml_compute_params * params
 
 static inline int64_t ggml_wrap_around(int64_t coord, int64_t size) {
     return (coord  + size) % size; // adding size avoids negative number weirdness
+}
+
+// ggml_compute_forward_snake_fused
+// Fused snake activation: y = x + sin^2(a * x) * inv_b.
+// x is [T, C] (T contiguous), a / inv_b collapse to [1, C].
+// Operands are extracted by the fusion path from the naive
+// mul -> sin -> sqr -> mul -> add chain. x and dst share one of
+// {f32, f16, bf16}; a and inv_b are F32, compute is F32.
+
+template <typename elem_t>
+static void ggml_compute_forward_snake_fused_impl(
+        const struct ggml_compute_params * params,
+        const struct ggml_tensor * x,
+        const struct ggml_tensor * a,
+        const struct ggml_tensor * inv_b,
+        struct ggml_tensor * dst) {
+    const int64_t T = x->ne[0];
+    const int64_t C = x->ne[1];
+
+    const elem_t * xd = (const elem_t *) x->data;
+    const float  * ad = (const float  *) a->data;
+    const float  * bd = (const float  *) inv_b->data;
+    elem_t       * yd = (elem_t       *) dst->data;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // Split over channels: each thread owns disjoint [c * T, (c + 1) * T) bands
+    for (int64_t c = ith; c < C; c += nth) {
+        const float ac = ad[c];
+        const float bc = bd[c];
+        const elem_t * xc = xd + c * T;
+        elem_t       * yc = yd + c * T;
+        for (int64_t t = 0; t < T; t++) {
+            const float xi = type_conversion_table<elem_t>::to_f32(xc[t]);
+            const float si = sinf(ac * xi);
+            yc[t] = type_conversion_table<elem_t>::from_f32(xi + si * si * bc);
+        }
+    }
+}
+
+void ggml_compute_forward_snake_fused(
+        const struct ggml_compute_params * params,
+        const struct ggml_tensor * x,
+        const struct ggml_tensor * a,
+        const struct ggml_tensor * inv_b,
+        struct ggml_tensor * dst) {
+    switch (x->type) {
+        case GGML_TYPE_F32:  ggml_compute_forward_snake_fused_impl<float>      (params, x, a, inv_b, dst); break;
+        case GGML_TYPE_F16:  ggml_compute_forward_snake_fused_impl<ggml_fp16_t>(params, x, a, inv_b, dst); break;
+        case GGML_TYPE_BF16: ggml_compute_forward_snake_fused_impl<ggml_bf16_t>(params, x, a, inv_b, dst); break;
+        default: GGML_ABORT("snake: unsupported type %d", x->type);
+    }
 }
 
 // ggml_compute_forward_col2im_1d
