@@ -1291,6 +1291,11 @@ struct test_case {
     }
 
     virtual bool run_whole_graph() { return false; }
+
+    // Composite forward cases normally skip finite differences. A small
+    // training regression can explicitly opt in without changing evaluation
+    // of the other composite graphs.
+    virtual bool grad_enabled() { return !run_whole_graph(); }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
     virtual bool use_weight_context() { return false; }
 
@@ -5854,6 +5859,8 @@ struct test_out_prod : public test_case {
 // initialized to zero, the first-step gradient of lora_A must also be zero.
 // This graph reaches lora_A through MUL_MAT's transposed OUT_PROD backward path.
 struct test_lora_zero_b : public test_case {
+    bool grad_enabled() override { return true; }
+
     std::string vars() override {
         return "in=8,rank=4,out=6,tokens=3";
     }
@@ -13042,7 +13049,7 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
     if (mode == MODE_GRAD) {
         test_cases.erase(
             std::remove_if(test_cases.begin(), test_cases.end(), [](const std::unique_ptr<test_case> & tc) {
-                return tc->run_whole_graph();
+                return !tc->grad_enabled();
             }),
             test_cases.end()
         );
