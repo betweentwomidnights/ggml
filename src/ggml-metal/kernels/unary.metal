@@ -203,6 +203,23 @@ kernel void kernel_silu_back_f32(
     dx[gid] = dy[gid] * s * (1.0f + x[gid] * (1.0f - s));
 }
 
+// Retain the audio fork's half-storage backward path alongside upstream F32.
+// Evaluate the derivative in float before rounding the result to half.
+kernel void kernel_silu_back_f16(
+        constant ggml_metal_kargs_silu_back & args,
+        device const half * dy,
+        device const half * x,
+        device       half * dx,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= args.ne) {
+        return;
+    }
+
+    const float xf = float(x[gid]);
+    const float s = 1.0f / (1.0f + exp(-xf));
+    dx[gid] = half(float(dy[gid]) * s * (1.0f + xf * (1.0f - s)));
+}
+
 template<typename T>
 kernel void kernel_reglu(
         constant ggml_metal_kargs_glu & args,

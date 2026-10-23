@@ -31,8 +31,9 @@ merged with the published shared fork tip `4ad3b30b`. Existing pinned history
 and authorship are preserved; this is a new integration branch, not a rewrite.
 
 The downstream Metal shaders now live in upstream's split kernel libraries.
-Upstream SILU_BACK and its newer dtype handling replace the older duplicate
-implementation. Repeat backward, frozen/quantized OUT_PROD, RMS norm backward,
+Upstream F32 SILU_BACK replaces the older duplicate implementation; the fork's
+F16 storage path is retained alongside it, computing the derivative in F32.
+Repeat backward, frozen/quantized OUT_PROD, RMS norm backward,
 softmax backward, strided binary operations, full-F32 matmul precision and
 tiled small-batch im2col remain downstream features. Upstream's equivalent
 scheduler race, CUDA get-rows/dequantization, normalization and batched-conv1d
@@ -41,10 +42,27 @@ and its unary path retains destination strides alongside upstream BF16/PDL.
 The Vulkan full-F32 operand path is adapted to upstream's pipeline map; the
 frozen F16/BF16/quantized OUT_PROD ports remain present.
 
-Preliminary validation: native CPU/Metal compilation and 173 targeted Metal
-training-operation comparisons pass on M4. This is not the complete adoption
-gate. Both draft fixes (#17, #18), application generation/training/resume,
-reference parity and the five-consumer bump check still require validation.
+The first integration (`71e21f9d`) compiles all five current audio applications
+on M4 and passes their 48/22/17/15 CTests (Stems has no configured CTest suite),
+all 22 native CTests, 173 targeted training-operation comparisons, the 36-case
+CONCAT oracle on CPU and Metal, six F32-precision controls, 326 quantized controls
+and 385 binary-operation controls. Both draft fixes (#17, #18) are included.
+SA3 training and resume commands succeed; uninterrupted/resumed adapter and
+optimizer tensors match exactly within each revision. Billie inference operators
+pass independent CPU PyTorch parity for all 352 adapted projections against the
+same Q4 base. These results do not establish full PyTorch training parity.
+
+The source audit subsequently caught two validation/preservation gaps: upstream's
+gradient runner excluded the composite zero-B LoRA regression, and its SILU_BACK
+replacement lacked the fork's F16 path. The LoRA case now explicitly opts in and
+visibly passes finite differences on CPU and Metal; F16 SILU_BACK has explicit
+multi-dimensional and threadgroup-boundary test cases. The final revision still
+requires the matching application validation recorded in ggml-bump-check.
+
+This is not an adoption approval. The corrected-old-to-new comparison matches
+all four unadapted SA3 generations, both Yue generations and the available Stems
+outputs/references, but some adapted SA3/ACE and sampled MusicGen outputs differ.
+Several Audiocraft PyTorch dumps and the Yue F32 transcription model are absent.
 CUDA/Vulkan compilation/runtime have not been established on this Mac.
 The August/October 0.17 validation below is historical evidence, not validation
 of the 0.27 migration.
