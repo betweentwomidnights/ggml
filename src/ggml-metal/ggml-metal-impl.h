@@ -966,6 +966,17 @@ typedef struct {
 } ggml_metal_kargs_soft_max_back;
 
 typedef struct {
+    int64_t nc;
+    int64_t nr;
+} ggml_metal_kargs_cross_entropy_loss;
+
+typedef struct {
+    int64_t  nc;
+    int64_t  nr;
+    uint64_t nb01;
+} ggml_metal_kargs_get_rows_back;
+
+typedef struct {
     int64_t  ne00;
     int64_t  ne01;
     int64_t  ne02;
