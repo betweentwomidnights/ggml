@@ -371,6 +371,15 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_soft_max_back(ctx, idx);
             } break;
+        case GGML_OP_CROSS_ENTROPY_LOSS:
+        case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
+            {
+                n_fuse = ggml_metal_op_cross_entropy_loss(ctx, idx);
+            } break;
+        case GGML_OP_GET_ROWS_BACK:
+            {
+                n_fuse = ggml_metal_op_get_rows_back(ctx, idx);
+            } break;
         case GGML_OP_SSM_CONV:
             {
                 n_fuse = ggml_metal_op_ssm_conv(ctx, idx);
@@ -1897,6 +1906,84 @@ int ggml_metal_op_soft_max_back(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, 32, 1, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_get_rows_back(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+    const ggml_tensor * grad = op->src[0];
+    const ggml_tensor * rows = op->src[1];
+
+    GGML_ASSERT(grad->type == GGML_TYPE_F32 || grad->type == GGML_TYPE_F16);
+    GGML_ASSERT(rows->type == GGML_TYPE_I32 && ggml_is_vector(rows) && ggml_is_contiguous(rows));
+    GGML_ASSERT(op->type == GGML_TYPE_F32 && ggml_is_matrix(op) && ggml_is_contiguous(op));
+    GGML_ASSERT(ggml_is_matrix(grad) && ggml_is_contiguous(grad));
+    GGML_ASSERT(grad->ne[0] == op->ne[0] && grad->ne[1] >= ggml_nelements(rows));
+
+    ggml_metal_kargs_get_rows_back args = {
+        /*.nc   =*/ op->ne[0],
+        /*.nr   =*/ ggml_nelements(rows),
+        /*.nb01 =*/ grad->nb[1],
+    };
+
+    auto enc = ctx->enc;
+    auto pipeline = ggml_metal_library_get_pipeline_get_rows_back(ctx->lib, grad->type);
+    const int nth = std::min(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(grad), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(rows), 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),   3);
+    ggml_metal_encoder_dispatch_threadgroups(enc, (args.nc + nth - 1)/nth, op->ne[1], 1, nth, 1, 1);
+    return 1;
+}
+
+int ggml_metal_op_cross_entropy_loss(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+    const bool backward = op->op == GGML_OP_CROSS_ENTROPY_LOSS_BACK;
+    const ggml_tensor * logits = op->src[backward ? 1 : 0];
+    const ggml_tensor * labels = op->src[backward ? 2 : 1];
+
+    GGML_ASSERT(logits->type == GGML_TYPE_F32 && ggml_is_contiguous(logits));
+    GGML_ASSERT(labels->type == GGML_TYPE_F32 && ggml_is_contiguous(labels));
+    GGML_ASSERT(op->type == GGML_TYPE_F32 && ggml_is_contiguous(op));
+    GGML_ASSERT(ggml_are_same_shape(logits, labels));
+    GGML_ASSERT(backward ? ggml_are_same_shape(logits, op) : ggml_is_scalar(op));
+    GGML_ASSERT(!backward || (op->src[0]->type == GGML_TYPE_F32 && ggml_is_scalar(op->src[0])));
+
+    ggml_metal_kargs_cross_entropy_loss args = {
+        /*.nc =*/ logits->ne[0],
+        /*.nr =*/ ggml_nrows(logits),
+    };
+
+    auto enc = ctx->enc;
+    auto dst = ggml_metal_get_buffer_id(op);
+    auto tmp = dst;
+    tmp.offs += ggml_nbytes(op);
+
+    auto pipeline = ggml_metal_library_get_pipeline_cross_entropy_loss(ctx->lib, op->op, false);
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(logits), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(labels), 2);
+    ggml_metal_encoder_set_buffer  (enc, backward ? dst : tmp, 3);
+    if (backward) {
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[0]), 4);
+    }
+    ggml_metal_encoder_dispatch_threadgroups(enc, args.nr, 1, 1, 32, 1, 1);
+
+    if (!backward) {
+        // The row losses live in allocator-reserved scratch after the scalar output.
+        // Finish their writes before reducing them, including with concurrent encoders.
+        ggml_metal_op_concurrency_reset(ctx);
+        pipeline = ggml_metal_library_get_pipeline_cross_entropy_loss(ctx->lib, op->op, true);
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, tmp, 1);
+        ggml_metal_encoder_set_buffer  (enc, dst, 2);
+        ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, 32, 1, 1);
+    }
 
     return 1;
 }

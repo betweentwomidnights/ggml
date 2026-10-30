@@ -1728,6 +1728,35 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                    ggml_is_contiguous_rows(op->src[1]) &&
                    ggml_is_contiguous_rows(op);
         }
+        case GGML_OP_GET_ROWS_BACK:
+            return op->type == GGML_TYPE_F32 &&
+                   (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
+                   op->src[1]->type == GGML_TYPE_I32 &&
+                   ggml_is_matrix(op->src[0]) && ggml_is_vector(op->src[1]) && ggml_is_matrix(op) &&
+                   op->src[0]->ne[0] == op->ne[0] &&
+                   op->src[0]->ne[1] >= ggml_nelements(op->src[1]) &&
+                   op->ne[1] <= INT32_MAX &&
+                   ggml_is_contiguous(op->src[0]) &&
+                   ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op);
+        case GGML_OP_CROSS_ENTROPY_LOSS:
+            return has_simdgroup_reduction &&
+                   op->type == GGML_TYPE_F32 && ggml_is_scalar(op) &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   ggml_nrows(op->src[0]) <= INT32_MAX &&
+                   ggml_are_same_shape(op->src[0], op->src[1]) &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
+        case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
+            return has_simdgroup_reduction &&
+                   op->type == GGML_TYPE_F32 &&
+                   op->src[0]->type == GGML_TYPE_F32 && ggml_is_scalar(op->src[0]) &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_F32 &&
+                   ggml_nrows(op->src[1]) <= INT32_MAX &&
+                   ggml_are_same_shape(op->src[1], op->src[2]) &&
+                   ggml_are_same_shape(op->src[1], op) &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                   ggml_is_contiguous(op->src[2]) && ggml_is_contiguous(op);
         case GGML_OP_COUNT_EQUAL:
             return has_simdgroup_reduction &&
                 op->src[0]->type == GGML_TYPE_I32 &&
