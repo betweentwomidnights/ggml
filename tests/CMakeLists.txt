@@ -1,3 +1,8 @@
+add_executable(test-mul-mat-f32-precision test-mul-mat-f32-precision.cpp)
+target_link_libraries(test-mul-mat-f32-precision PRIVATE ggml)
+add_test(NAME test-mul-mat-f32-precision COMMAND $<TARGET_FILE:test-mul-mat-f32-precision>)
+set_tests_properties(test-mul-mat-f32-precision PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "GGML_CUDA_TF32=0")
+
 if (GGML_VULKAN)
     add_executable(test-vulkan-out-prod test-vulkan-out-prod.cpp)
     target_link_libraries(test-vulkan-out-prod PRIVATE ggml)

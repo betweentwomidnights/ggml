@@ -1836,6 +1836,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
         return;
     }
+    // MMF uses reduced-precision tensor-core operands for F32 inputs. An explicit
+    // F32 request must reach the cuBLAS F32 path, where GGML_CUDA_TF32=0
+    // can disable operand truncation for full-precision reference work.
+    // Keep the F32 MMVF path above: it already honors the requested precision.
+    if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->op_params[0] == GGML_PREC_F32) {
+        ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+        return;
+    }
     if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
