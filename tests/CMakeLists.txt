@@ -2,6 +2,12 @@ add_executable(test-concat-backward test-concat-backward.cpp)
 target_link_libraries(test-concat-backward PRIVATE ggml)
 add_test(NAME test-concat-backward COMMAND $<TARGET_FILE:test-concat-backward> CPU)
 
+add_executable(test-mul-mat-f32-source test-mul-mat-f32-source.cpp)
+target_link_libraries(test-mul-mat-f32-source PRIVATE ggml)
+add_test(NAME test-mul-mat-f32-source COMMAND $<TARGET_FILE:test-mul-mat-f32-source>)
+set_tests_properties(test-mul-mat-f32-source PROPERTIES
+    SKIP_RETURN_CODE 77 ENVIRONMENT "GGML_CUDA_TF32=0")
+
 if (GGML_VULKAN)
     add_executable(test-vulkan-out-prod test-vulkan-out-prod.cpp)
     target_link_libraries(test-vulkan-out-prod PRIVATE ggml)
