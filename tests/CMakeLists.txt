@@ -6,7 +6,7 @@ add_executable(test-mul-mat-f32-source test-mul-mat-f32-source.cpp)
 target_link_libraries(test-mul-mat-f32-source PRIVATE ggml)
 add_test(NAME test-mul-mat-f32-source COMMAND $<TARGET_FILE:test-mul-mat-f32-source>)
 set_tests_properties(test-mul-mat-f32-source PROPERTIES
-    SKIP_RETURN_CODE 77 ENVIRONMENT "GGML_CUDA_TF32=0")
+    SKIP_RETURN_CODE 77 ENVIRONMENT "GGML_CUDA_TF32=0;GGML_CUDA_CUBLAS_COMPUTE_TYPE=auto")
 
 if (GGML_VULKAN)
     add_executable(test-vulkan-out-prod test-vulkan-out-prod.cpp)

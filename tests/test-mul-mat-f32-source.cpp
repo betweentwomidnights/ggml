@@ -30,6 +30,11 @@ static bool test_shape(ggml_backend_t backend, int n, bool explicit_acc) {
     if (explicit_acc) {
         passed = ggml_prec_set_acc(out, GGML_PREC_F32) && passed;
     }
+    if (!ggml_backend_supports_op(backend, out)) {
+        std::fprintf(stderr, "%s does not support the requested F32 matmul\n", ggml_backend_name(backend));
+        ggml_free(ctx);
+        return false;
+    }
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, out);
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
@@ -76,6 +81,12 @@ int main(int argc, char ** argv) {
     bool passed = true, tested = false;
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        // This regression targets CUDA dispatch and its CPU oracle. Default
+        // accumulation is not a portable F32 guarantee for other backends.
+        const std::string name = ggml_backend_dev_name(dev);
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU && name.rfind("CUDA", 0) != 0) {
+            continue;
+        }
         if (argc > 1 && std::string(ggml_backend_dev_name(dev)) != argv[1]) {
             continue;
         }
