@@ -598,6 +598,32 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_soft_max_back(gg
 }
 
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_get_rows_back(
+        ggml_metal_library_t lib, enum ggml_type tsrc) {
+    char name[256];
+    snprintf(name, sizeof(name), "kernel_get_rows_back_%s", ggml_type_name(tsrc));
+    auto res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cross_entropy_loss(
+        ggml_metal_library_t lib, enum ggml_op op, bool reduce) {
+    GGML_ASSERT(op == GGML_OP_CROSS_ENTROPY_LOSS || op == GGML_OP_CROSS_ENTROPY_LOSS_BACK);
+    GGML_ASSERT(!reduce || op == GGML_OP_CROSS_ENTROPY_LOSS);
+
+    const char * name = reduce ? "kernel_cross_entropy_loss_reduce_f32" :
+        op == GGML_OP_CROSS_ENTROPY_LOSS_BACK ? "kernel_cross_entropy_loss_back_f32" :
+                                              "kernel_cross_entropy_loss_f32";
+    auto res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv(
         ggml_metal_library_t lib, const ggml_tensor * op, int32_t nc, bool use_silu) {
     GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);

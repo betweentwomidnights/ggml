@@ -1,5 +1,83 @@
 #include "common.h"
 
+// One SIMDgroup per contiguous row. Subtract the maximum before exponentiating,
+// and compute log-softmax directly so a very unlikely label still has finite loss.
+kernel void kernel_cross_entropy_loss_f32(
+        constant ggml_metal_kargs_cross_entropy_loss & args,
+        device const float * logits,
+        device const float * labels,
+        device       float * losses,
+        uint3 row [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]]) {
+    logits += int64_t(row.x)*args.nc;
+    labels += int64_t(row.x)*args.nc;
+
+    float max_logit = -INFINITY;
+    for (int64_t c = lane; c < args.nc; c += N_SIMDWIDTH) {
+        max_logit = max(max_logit, logits[c]);
+    }
+    max_logit = simd_max(max_logit);
+
+    float sum_exp = 0.0f;
+    for (int64_t c = lane; c < args.nc; c += N_SIMDWIDTH) {
+        sum_exp += exp(logits[c] - max_logit);
+    }
+    const float log_sum = log(simd_sum(sum_exp));
+
+    float loss = 0.0f;
+    for (int64_t c = lane; c < args.nc; c += N_SIMDWIDTH) {
+        loss += (logits[c] - max_logit - log_sum)*labels[c];
+    }
+    loss = -simd_sum(loss)/float(args.nr);
+    if (lane == 0) {
+        losses[row.x] = loss;
+    }
+}
+
+kernel void kernel_cross_entropy_loss_reduce_f32(
+        constant ggml_metal_kargs_cross_entropy_loss & args,
+        device const float * losses,
+        device       float * dst,
+        ushort lane [[thread_index_in_simdgroup]]) {
+    float loss = 0.0f;
+    for (int64_t row = lane; row < args.nr; row += N_SIMDWIDTH) {
+        loss += losses[row];
+    }
+    loss = simd_sum(loss);
+    if (lane == 0) {
+        dst[0] = loss;
+    }
+}
+
+kernel void kernel_cross_entropy_loss_back_f32(
+        constant ggml_metal_kargs_cross_entropy_loss & args,
+        device const float * logits,
+        device const float * labels,
+        device       float * dst,
+        device const float * grad,
+        uint3 row [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]]) {
+    logits += int64_t(row.x)*args.nc;
+    labels += int64_t(row.x)*args.nc;
+    dst    += int64_t(row.x)*args.nc;
+
+    float max_logit = -INFINITY;
+    for (int64_t c = lane; c < args.nc; c += N_SIMDWIDTH) {
+        max_logit = max(max_logit, logits[c]);
+    }
+    max_logit = simd_max(max_logit);
+
+    float sum_exp = 0.0f;
+    for (int64_t c = lane; c < args.nc; c += N_SIMDWIDTH) {
+        sum_exp += exp(logits[c] - max_logit);
+    }
+    const float inv_sum = 1.0f/simd_sum(sum_exp);
+    const float scale = grad[0]/float(args.nr);
+    for (int64_t c = lane; c < args.nc; c += N_SIMDWIDTH) {
+        dst[c] = (exp(logits[c] - max_logit)*inv_sum - labels[c])*scale;
+    }
+}
+
 template<typename T>
 kernel void kernel_soft_max(
         constant ggml_metal_kargs_soft_max & args,

@@ -2502,7 +2502,7 @@ struct test_get_rows_back : public test_case {
                 // rows
                 std::vector<int> data(r*b);
                 for (int i = 0; i < r*b; i++) {
-                    data[i] = rand() % m;
+                    data[i] = i%3 == 0 ? 0 : (17*i + 1)%m;
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, r * b * sizeof(int));
             } else {
@@ -8680,14 +8680,15 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
+    const bool one_hot;
 
     std::string vars() override {
-        return VARS_TO_STR2(type, ne);
+        return VARS_TO_STR3(type, ne, one_hot);
     }
 
     test_cross_entropy_loss(ggml_type type = GGML_TYPE_F32,
-            std::array<int64_t, 4> ne = {10, 5, 4, 3})
-        : type(type), ne(ne) {}
+            std::array<int64_t, 4> ne = {10, 5, 4, 3}, bool one_hot = false)
+        : type(type), ne(ne), one_hot(one_hot) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * logits = ggml_new_tensor(ctx, type, 4, ne.data());
@@ -8699,7 +8700,9 @@ struct test_cross_entropy_loss : public test_case {
         ggml_set_name(labels, "labels");
 
         // Ensure labels add up to 1:
-        labels = ggml_soft_max(ctx, labels);
+        if (!one_hot) {
+            labels = ggml_soft_max(ctx, labels);
+        }
         ggml_set_name(labels, "labels_normalized");
 
         ggml_tensor * out = ggml_cross_entropy_loss(ctx, logits, labels);
@@ -8711,7 +8714,15 @@ struct test_cross_entropy_loss : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         // For larger abs. diffs between logits softmax is more linear, therefore more precise num. gradients.
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            init_tensor_uniform(t, -100.0f, 100.0f);
+            if (one_hot && strcmp(t->name, "labels_normalized") == 0) {
+                std::vector<float> data(ggml_nelements(t), 0.0f);
+                for (int64_t r = 0; r < ggml_nrows(t); ++r) {
+                    data[r*ne[0] + (17*r + 3)%ne[0]] = 1.0f;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+            } else {
+                init_tensor_uniform(t, -100.0f, 100.0f);
+            }
         }
     }
 
@@ -8728,14 +8739,15 @@ struct test_cross_entropy_loss : public test_case {
 struct test_cross_entropy_loss_back : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
+    const bool one_hot;
 
     std::string vars() override {
-        return VARS_TO_STR2(type, ne);
+        return VARS_TO_STR3(type, ne, one_hot);
     }
 
     test_cross_entropy_loss_back(ggml_type type = GGML_TYPE_F32,
-            std::array<int64_t, 4> ne = {10, 5, 4, 3})
-        : type(type), ne(ne) {}
+            std::array<int64_t, 4> ne = {10, 5, 4, 3}, bool one_hot = false)
+        : type(type), ne(ne), one_hot(one_hot) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * grad = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
@@ -8748,13 +8760,32 @@ struct test_cross_entropy_loss_back : public test_case {
         ggml_set_name(labels, "labels");
 
         // Ensure labels add up to 1:
-        labels = ggml_soft_max(ctx, labels);
+        if (!one_hot) {
+            labels = ggml_soft_max(ctx, labels);
+        }
         ggml_set_name(labels, "labels_normalized");
 
         ggml_tensor * out = ggml_cross_entropy_loss_back(ctx, grad, logits, labels);
         ggml_set_name(out, "out");
 
         return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "grad") == 0) {
+                const float grad = -0.75f;
+                ggml_backend_tensor_set(t, &grad, 0, sizeof(grad));
+            } else if (one_hot && strcmp(t->name, "labels_normalized") == 0) {
+                std::vector<float> data(ggml_nelements(t), 0.0f);
+                for (int64_t r = 0; r < ggml_nrows(t); ++r) {
+                    data[r*ne[0] + (17*r + 3)%ne[0]] = 1.0f;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+            } else {
+                init_tensor_uniform(t, -100.0f, 100.0f);
+            }
+        }
     }
 };
 
@@ -9951,6 +9982,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 8, 2, 1, false));
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 70000, 4, 1, false)); // row count > CUDA grid-y limit (65535)
+    // Repeated row ids must accumulate, and unselected rows must be overwritten with zero.
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        test_cases.emplace_back(new test_get_rows_back(type, 7, 17, 37));
+        test_cases.emplace_back(new test_get_rows_back(type, 2048, 13, 21));
+    }
     for (ggml_type type : all_types) {
         for (bool v : {false, true}) {
             test_cases.emplace_back(new test_get_rows_back(type, 256, 5, 4, 1, v));
@@ -12054,6 +12090,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {30000, 1, 1, 1}));
+
+    // SIMD-width boundaries, irregular row counts, and MusicGen/vocabulary-sized rows.
+    for (const std::array<int64_t, 4> & ne : {
+            std::array<int64_t, 4>{1, 1, 1, 1}, {7, 3, 2, 1},
+            {31, 1, 1, 1}, {32, 33, 1, 1}, {33, 3, 1, 1},
+            {2048, 7, 1, 1}, {2049, 2, 2, 1}, {10, 257, 2, 1}, {30000, 3, 1, 1}}) {
+        for (bool one_hot : {false, true}) {
+            test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, ne, one_hot));
+            test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, ne, one_hot));
+        }
+    }
 
     test_cases.emplace_back(new test_opt_step_adamw(GGML_TYPE_F32, {10, 5, 4, 3}));
     test_cases.emplace_back(new test_opt_step_sgd(GGML_TYPE_F32, {10, 5, 4, 3}));

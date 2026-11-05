@@ -322,6 +322,35 @@ kernel void kernel_get_rows_f(
     }
 }
 
+// Each destination element accumulates matching source rows in index order.
+// This also writes zero for unselected rows and avoids float-atomic races when
+// row indices repeat, matching CPU accumulation deterministically.
+template<typename T>
+kernel void kernel_get_rows_back(
+        constant ggml_metal_kargs_get_rows_back & args,
+        device const char * grad,
+        device const int32_t * rows,
+        device float * dst,
+        uint3 group [[threadgroup_position_in_grid]],
+        uint3 tpitg [[thread_position_in_threadgroup]],
+        uint3 size [[threads_per_threadgroup]]) {
+    const int64_t col = int64_t(group.x)*size.x + tpitg.x;
+    if (col >= args.nc) {
+        return;
+    }
+    float sum = 0.0f;
+    for (int64_t r = 0; r < args.nr; ++r) {
+        if (rows[r] == int32_t(group.y)) {
+            sum += float(((device const T *)(grad + r*args.nb01))[col]);
+        }
+    }
+    dst[int64_t(group.y)*args.nc + col] = sum;
+}
+
+typedef decltype(kernel_get_rows_back<float>) get_rows_back_t;
+template [[host_name("kernel_get_rows_back_f32")]] kernel get_rows_back_t kernel_get_rows_back<float>;
+template [[host_name("kernel_get_rows_back_f16")]] kernel get_rows_back_t kernel_get_rows_back<half>;
+
 typedef decltype(kernel_get_rows_f<float, float>) get_rows_f_t;
 
 template [[host_name("kernel_get_rows_f32")]]  kernel get_rows_f_t kernel_get_rows_f<float, float>;
