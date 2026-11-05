@@ -76,15 +76,29 @@ static bool test_shape(ggml_backend_t backend, int n, bool explicit_acc) {
     return passed;
 }
 
+// Vulkan honors an F32 src1 only with F32 accumulation (its F32 x F32 path); with default accumulation it
+// must refuse the op, so a caller without a scheduler fallback fails loudly instead of losing precision.
+static bool vulkan_refuses_default_acc(ggml_backend_t backend) {
+    ggml_context * ctx = ggml_init({1024*1024, nullptr, true});
+    ggml_tensor * out = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 512, 64),
+                                     ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 512, 8));
+    ggml_prec_set_src(out, GGML_PREC_F32, 1);
+    const bool refused = !ggml_backend_supports_op(backend, out);
+    std::printf("%s F32 src1, default acc: %s\n", ggml_backend_name(backend), refused ? "refused PASS" : "accepted FAIL");
+    ggml_free(ctx);
+    return refused;
+}
+
 int main(int argc, char ** argv) {
     ggml_backend_load_all();
     bool passed = true, tested = false;
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        // This regression targets CUDA dispatch and its CPU oracle. Default
+        // This regression targets CUDA dispatch and its CPU oracle, plus Vulkan's F32 x F32 path. Default
         // accumulation is not a portable F32 guarantee for other backends.
         const std::string name = ggml_backend_dev_name(dev);
-        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU && name.rfind("CUDA", 0) != 0) {
+        const bool vulkan = name.rfind("Vulkan", 0) == 0;
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU && name.rfind("CUDA", 0) != 0 && !vulkan) {
             continue;
         }
         if (argc > 1 && std::string(ggml_backend_dev_name(dev)) != argv[1]) {
@@ -95,9 +109,15 @@ int main(int argc, char ** argv) {
             continue;
         }
         tested = true;
-        // MMVF, MMF interior/boundaries, and the ordinary GEMM path.
+        if (vulkan) {
+            passed = vulkan_refuses_default_acc(backend) && passed;
+        }
+        // MMVF, MMF interior/boundaries, and the ordinary GEMM path (Vulkan: mat-vec and mat-mat).
         for (int n : {1, 5, 8, 16, 17, 25, 64}) {
             for (bool explicit_acc : {false, true}) {
+                if (vulkan && !explicit_acc) {
+                    continue;
+                }
                 passed = test_shape(backend, n, explicit_acc) && passed;
             }
         }

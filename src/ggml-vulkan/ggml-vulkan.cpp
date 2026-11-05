@@ -15691,7 +15691,13 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                         return false;
                     }
                 }
-                if (ggml_prec_get_src(op, 1) == GGML_PREC_F32) {
+                // A src1 that must stay F32 is honored only by the fork's F32 x F32 path (f32_prec /
+                // f32_operands in ggml_vk_mul_mat_q_f16), which needs F32 accumulation and dim01-contiguous
+                // F32 operands. Anything else may convert src1 to F16 or Q8_1, so it is refused.
+                if (ggml_prec_get_src(op, 1) == GGML_PREC_F32 &&
+                    !(op->op == GGML_OP_MUL_MAT && src0_type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                      ggml_prec_get_acc(op) == GGML_PREC_F32 &&
+                      ggml_vk_dim01_contiguous(op->src[0]) && ggml_vk_dim01_contiguous(op->src[1]))) {
                     return false;
                 }
                 switch (src0_type) {
