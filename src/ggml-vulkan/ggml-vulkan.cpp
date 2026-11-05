@@ -6489,13 +6489,18 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         src1_uma = d_Qy != nullptr;
     }
 
+    // F32 x F32 with F32 accumulation stays F32 end to end. Contiguous operands are read in place; when
+    // the caller also pins src1 to F32, non-contiguous operands (permuted attention Q/K views) are staged
+    // as contiguous F32 instead of F16. Accumulation-only requests keep their F16 staging.
     const bool f32_prec = src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
                           (ggml_prec)dst->op_params[0] == GGML_PREC_F32 &&
-                          ggml_vk_dim01_contiguous(src0) && ggml_vk_dim01_contiguous(src1);
+                          ((ggml_vk_dim01_contiguous(src0) && ggml_vk_dim01_contiguous(src1)) ||
+                           ggml_prec_get_src(dst, 1) == GGML_PREC_F32);
     const bool x_non_contig = (ctx->device->coopmat2 && src0->type == GGML_TYPE_F32 && !f32_prec) ||
                               !ggml_vk_dim01_contiguous(src0);
     // If src0 is BF16, try to use a BF16 x BF16 multiply
     ggml_type f16_type = src0->type == GGML_TYPE_BF16 ? GGML_TYPE_BF16 : GGML_TYPE_F16;
+    const ggml_type x_stage_type = f32_prec ? GGML_TYPE_F32 : f16_type;
 
     const bool is_coopmat = ctx->device->coopmat_support || ctx->device->coopmat2;
     const bool can_quantize_y = !f32_prec && (ctx->device->integer_dot_product || ctx->device->coopmat_int_support) &&
@@ -6503,7 +6508,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     // coopmat shaders are fast enough that memory bandwidth reduction from f16 activations helps
     const bool prefer_f16_b = is_coopmat && ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32;
 
-    const ggml_type y_kernel_type = ggml_vk_mul_mat_b_type(ctx, src0->type, src1, f16_type,
+    const ggml_type y_kernel_type = f32_prec ? GGML_TYPE_F32 :
+                                    ggml_vk_mul_mat_b_type(ctx, src0->type, src1, f16_type,
                                         ggml_prec_get_acc(dst), false, can_quantize_y, prefer_f16_b);
 
     const bool quantize_y       = y_kernel_type == GGML_TYPE_Q8_1;
@@ -6517,8 +6523,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const bool qy_needs_dequant = y_needs_reformat;
 
     if (qx_needs_dequant) {
-        // dequant src0 to f16
-        mmp_map = ggml_vk_get_mul_mat_mat_pipeline_map(ctx, f16_type, y_kernel_type, ggml_prec_get_acc(dst));
+        // dequant src0 to f16 (or stage it as contiguous F32 on the F32 x F32 path)
+        mmp_map = ggml_vk_get_mul_mat_mat_pipeline_map(ctx, x_stage_type, y_kernel_type, ggml_prec_get_acc(dst));
     }
 
     GGML_ASSERT(mmp_map != nullptr);
@@ -6543,7 +6549,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     const uint64_t qx_sz = ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type);
     const uint64_t qy_sz = ggml_type_size(src1->type) * y_ne / ggml_blck_size(src1->type);
-    const uint64_t x_sz = !qx_needs_dequant ? qx_sz : sizeof(ggml_fp16_t) * x_ne;
+    const uint64_t x_sz = !qx_needs_dequant ? qx_sz : ggml_type_size(x_stage_type) * x_ne;
     const uint64_t y_sz = quantize_y ? (ggml_vk_align_size(y_ne, 128) * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1)) : (y_f32_kernel ? sizeof(float) * y_ne : sizeof(ggml_fp16_t) * y_ne);
     const uint64_t d_sz = sizeof(float) * d_ne;
 
@@ -6552,7 +6558,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     vk_pipeline to_q8_1 = nullptr;
 
     if (x_non_contig) {
-        to_fp16_vk_0 = ggml_vk_get_cpy_pipeline(ctx, src0, nullptr, f16_type);
+        to_fp16_vk_0 = ggml_vk_get_cpy_pipeline(ctx, src0, nullptr, x_stage_type);
     } else {
         to_fp16_vk_0 = ggml_vk_get_to_fp16(ctx, src0->type);
     }
@@ -6700,7 +6706,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     // column stride in bytes of the B buffer: raw src1 keeps its own stride, staging buffers are tightly packed
     const uint64_t b_col_bytes = (y_needs_reformat || qy_needs_dequant || quantize_y)
-        ? (quantize_y ? (uint64_t)(ne10 / ggml_blck_size(GGML_TYPE_Q8_1)) * ggml_type_size(GGML_TYPE_Q8_1) : (uint64_t)ne10 * sizeof(ggml_fp16_t))
+        ? (quantize_y ? (uint64_t)(ne10 / ggml_blck_size(GGML_TYPE_Q8_1)) * ggml_type_size(GGML_TYPE_Q8_1)
+                      : (uint64_t)ne10 * (y_f32_kernel ? sizeof(float) : sizeof(ggml_fp16_t)))
         : (uint64_t)src1->nb[1];
 
     // compute
@@ -15692,12 +15699,12 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     }
                 }
                 // A src1 that must stay F32 is honored only by the fork's F32 x F32 path (f32_prec /
-                // f32_operands in ggml_vk_mul_mat_q_f16), which needs F32 accumulation and dim01-contiguous
-                // F32 operands. Anything else may convert src1 to F16 or Q8_1, so it is refused.
+                // f32_operands in ggml_vk_mul_mat_q_f16), which needs F32 accumulation and F32 operands and,
+                // for a pinned src1, stages non-contiguous ones as contiguous F32. Anything else may convert
+                // src1 to F16 or Q8_1, so it is refused.
                 if (ggml_prec_get_src(op, 1) == GGML_PREC_F32 &&
                     !(op->op == GGML_OP_MUL_MAT && src0_type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
-                      ggml_prec_get_acc(op) == GGML_PREC_F32 &&
-                      ggml_vk_dim01_contiguous(op->src[0]) && ggml_vk_dim01_contiguous(op->src[1]))) {
+                      ggml_prec_get_acc(op) == GGML_PREC_F32)) {
                     return false;
                 }
                 switch (src0_type) {
