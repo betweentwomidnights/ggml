@@ -1063,9 +1063,12 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     const int16_t r2   = (int16_t) (ne12 / op->src[0]->ne[2]);
     const int16_t r3   = (int16_t) (ne13 / op->src[0]->ne[3]);
 
-    // GGML_PREC_F32 on F32 x F32 keeps both operands fp32 in threadgroup memory
+    // GGML_PREC_F32 on F32 x F32 keeps both operands fp32 in threadgroup memory. A caller that pins
+    // src1 to F32 (ggml_prec_set_src) asks for the same thing: without it the half-staging kernel
+    // serves N > 16 and silently drops the pinned operand's precision.
     const bool prec_f32 = !has_tensor && tsrc0 == GGML_TYPE_F32 && tsrc1 == GGML_TYPE_F32 &&
-                          ggml_get_op_params_i32(op, 0) == GGML_PREC_F32;
+                          (ggml_get_op_params_i32(op, 0) == GGML_PREC_F32 ||
+                           ggml_prec_get_src(op, 1) == GGML_PREC_F32);
 
     snprintf(base, 256, "kernel_mul_mm_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), prec_f32 ? "_prec" : "");
     snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d",

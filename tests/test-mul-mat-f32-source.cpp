@@ -160,11 +160,12 @@ int main(int argc, char ** argv) {
     bool passed = true, tested = false;
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        // This regression targets CUDA dispatch and its CPU oracle, plus Vulkan's F32 x F32 path. Default
-        // accumulation is not a portable F32 guarantee for other backends.
+        // This regression targets CUDA dispatch and its CPU oracle, Vulkan's F32 x F32 path and Metal's
+        // F32 mat-mat kernel. Default accumulation is not a portable F32 guarantee for other backends.
         const std::string name = ggml_backend_dev_name(dev);
         const bool vulkan = name.rfind("Vulkan", 0) == 0;
-        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU && name.rfind("CUDA", 0) != 0 && !vulkan) {
+        const bool metal  = name.rfind("MTL", 0) == 0;
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU && name.rfind("CUDA", 0) != 0 && !vulkan && !metal) {
             continue;
         }
         if (argc > 1 && std::string(ggml_backend_dev_name(dev)) != argv[1]) {
