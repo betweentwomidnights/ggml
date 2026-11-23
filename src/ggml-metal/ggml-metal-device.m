@@ -10,6 +10,7 @@
 
 #include <Metal/Metal.h>
 
+#include <dlfcn.h>
 #include <stdatomic.h>
 
 #ifndef TARGET_OS_VISION
@@ -198,6 +199,7 @@ static void ggml_metal_library_build_index(ggml_metal_library_t lib) {
 }
 
 // note: defined below, after struct ggml_metal_device
+static void ggml_metal_device_disable_bfloat(ggml_metal_device_t dev);
 static void ggml_metal_device_disable_tensor(ggml_metal_device_t dev);
 
 // the tensor API headers are exposed to the shader compiler only at Metal language version 4.0
@@ -405,9 +407,18 @@ static bool ggml_metal_library_compile_all(
     return ok;
 }
 
-// look for <name>.metallib as a bundle resource, then next to the running binary
+// Look next to the backend first, then in its bundle or next to the executable.
 static NSString * ggml_metal_find_metallib(NSBundle * bundle, NSString * name) {
     NSError * error = nil;
+
+    Dl_info image;
+    if (dladdr((const void *) &ggml_metal_find_metallib, &image) && image.dli_fname) {
+        NSString * backend_dir = [[NSString stringWithUTF8String:image.dli_fname] stringByDeletingLastPathComponent];
+        NSString * sibling = [backend_dir stringByAppendingPathComponent:[name stringByAppendingPathExtension:@"metallib"]];
+        if ([[NSFileManager defaultManager] isReadableFileAtPath:sibling]) {
+            return [sibling stringByResolvingSymlinksInPath];
+        }
+    }
 
     NSString * path_lib = [bundle pathForResource:name ofType:@"metallib"];
     if (path_lib == nil) {
@@ -508,10 +519,18 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
     const int64_t t_start = ggml_time_us();
 
     NSError * error = nil;
-    NSString * path_lib = ggml_metal_find_metallib(bundle, @"default");
+    NSString * path_lib = nil;
+    if (ggml_metal_device_get_props(dev)->has_bfloat) {
+        if (@available(macOS 14.0, iOS 17.0, tvOS 17.0, *)) {
+            path_lib = ggml_metal_find_metallib(bundle, @"default-bf16");
+        }
+    }
+    if (path_lib == nil) {
+        path_lib = ggml_metal_find_metallib(bundle, @"default");
+    }
 
     if (path_lib != nil) {
-        // pre-compiled library found: a single combined default.metallib
+        // The precompiled library contains all the ordinary kernels.
         NSURL * libURL = [NSURL fileURLWithPath:path_lib];
         GGML_LOG_INFO("%s: loading '%s'\n", __func__, [path_lib UTF8String]);
 
@@ -521,6 +540,12 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
             GGML_LOG_ERROR("%s: error: %s\n", __func__, [[error description] UTF8String]);
             ggml_metal_library_free(res);
             return NULL;
+        }
+
+        // The base library is also used on OS versions without BF16 support.
+        if (ggml_metal_device_get_props(dev)->has_bfloat &&
+                ![[res->objs[0] functionNames] containsObject:@"kernel_cpy_f32_bf16"]) {
+            ggml_metal_device_disable_bfloat(dev);
         }
 
         // the tensor API kernels are built into a separate metallib
@@ -2082,6 +2107,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
 
 const struct ggml_metal_device_props * ggml_metal_device_get_props(ggml_metal_device_t dev) {
     return &dev->props;
+}
+
+static void ggml_metal_device_disable_bfloat(ggml_metal_device_t dev) {
+    dev->props.has_bfloat = false;
 }
 
 static void ggml_metal_device_disable_tensor(ggml_metal_device_t dev) {
